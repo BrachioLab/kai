@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # User home directory for all kai files — mirrors ~/.oh-my-zsh layout
-_VERSION  = "0.2.2"
+_VERSION  = "0.2.3"
 _KAI_HOME = os.path.expanduser("~/.kai")
 
 # Namespace for all workloads.
@@ -534,11 +534,14 @@ def cmd_submit(args):
         if not args.port:
             _die("--forward requires at least one --port declaration")
         mappings = [f"{p}:{p}" if ":" not in str(p) else str(p) for p in args.port]
-        # Kill any stale port-forward processes on the same local ports
+        # Kill any stale process holding the local ports, then wait for sockets to close
         for m in mappings:
             local_port = m.split(":")[0]
-            subprocess.run(["pkill", "-f", f"kubectl.*port-forward.*{local_port}"],
+            subprocess.run(["fuser", "-k", f"{local_port}/tcp"],
                            capture_output=True)
+            subprocess.run(["pkill", "-f", f"port-forward.*{local_port}"],
+                           capture_output=True)
+        time.sleep(1)
         print(f"Waiting for job {name} to start...")
         pod = _wait_for_job_pod(name, timeout=600)
         print(f"Forwarding {', '.join(mappings)}  (Ctrl-C to stop)\n")
