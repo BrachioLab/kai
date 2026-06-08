@@ -1026,11 +1026,16 @@ def cmd_update(args):
                 new_script = resp.read()
             with open(kai_bin, "rb") as f:
                 current_script = f.read()
-            if new_script == current_script:
+            if new_script == current_script and not force:
                 if not quiet:
                     print("kai binary is up to date")
             else:
-                if not force:
+                if force:
+                    with open(kai_bin, "wb") as f:
+                        f.write(new_script)
+                    os.chmod(kai_bin, 0o755)
+                    print("[kai] kai updated to latest version.")
+                else:
                     print()
                     print("[kai] A kai update is available.")
                     sys.stdout.write("[kai] Would you like to apply it? [Y/n] ")
@@ -1049,11 +1054,6 @@ def cmd_update(args):
                             f.write(new_script)
                         os.chmod(kai_bin, 0o755)
                         print("[kai] kai updated to latest version.")
-                else:
-                    with open(kai_bin, "wb") as f:
-                        f.write(new_script)
-                    os.chmod(kai_bin, 0o755)
-                    print("[kai] kai updated to latest version.")
         except Exception as e:
             if not quiet:
                 print(f"kai: binary update check failed: {e}", file=sys.stderr)
