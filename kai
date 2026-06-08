@@ -54,7 +54,7 @@ KUBECONFIG = os.environ.get("KUBECONFIG", _DEFAULT_KUBECONFIG)
 _KAI_SCRIPT_URL = "https://raw.githubusercontent.com/BrachioLab/kai/main/kai"
 
 # Populated from config file
-DEFAULT_QUEUE   = "members"
+DEFAULT_QUEUE   = "preemptible"
 ALLOWED_QUEUES  = None   # None = unrestricted (admin/no config file)
 ROLE            = None
 PARENT_QUEUE    = None
@@ -123,8 +123,8 @@ def _read_github_token():
 
 # Queue → KAI built-in priorityClassName
 QUEUE_PRIORITY_CLASS = {
-    "members":     "build",   # value 100, non-preemptible
-    "preemptible": "train",   # value 50,  reclaimable
+    "preemptible": "train",   # value 50, reclaimable — default queue
+    # machine-specific queues (carnaroli, jasmine, etc.) fall through to "build"
 }
 
 # Friendly GPU type shorthand → nvidia.com/gpu.product label value
@@ -316,11 +316,11 @@ def cmd_submit(args):
         k, v = e.split("=", 1)
         envs[k] = v
 
-    # backoffLimit default: members run once; preemptible survives evictions
+    # backoffLimit default: preemptible jobs retry after eviction; guaranteed queues fail fast
     if args.backoff_limit is not None:
         backoff = args.backoff_limit
     else:
-        backoff = 0 if args.queue == "members" else 10
+        backoff = 10 if args.queue == "preemptible" else 0
 
     manifest = _build_manifest(
         name=name,
@@ -1102,7 +1102,7 @@ def main():
     p.add_argument("--large-shm", action="store_true",
                    help="Replace /dev/shm with an in-memory emptyDir (no size cap; needed for PyTorch multiprocessing)")
     p.add_argument("--backoff-limit", type=int, metavar="N",
-                   help="Retry limit (default: 0 for members, 10 for preemptible)")
+                   help="Retry limit (default: 10 for preemptible, 0 for guaranteed queues)")
     p.add_argument("--env", action="append", metavar="KEY=VALUE",
                    help="Set an environment variable (repeatable)")
     p.add_argument("--volume", "-v", action="append", metavar="HOST:CONTAINER[:ro]",
