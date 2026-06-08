@@ -687,7 +687,7 @@ def cmd_add_user(args):
     if args.role == "lab-manager":
         cli_cfg["parent_queue"] = lab_name
     if CONFIG_BASE_URL:
-        cli_cfg["config_url"]      = f"{CONFIG_BASE_URL}/{NAMESPACE}-{args.name}.yaml"
+        cli_cfg["config_url"]      = f"{CONFIG_BASE_URL}/{args.name}.yaml"
         cli_cfg["config_base_url"] = CONFIG_BASE_URL
     if QUEUE_NODES:
         cli_cfg["queue_nodes"] = dict(QUEUE_NODES)
@@ -709,7 +709,7 @@ def cmd_add_user(args):
         )
 
     owner, repo, branch, path_prefix = _parse_raw_github_url(CONFIG_BASE_URL)
-    config_filename = f"{NAMESPACE}-{args.name}.yaml"
+    config_filename = f"{args.name}.yaml"
     config_gh_path = f"{path_prefix}/{config_filename}" if path_prefix else config_filename
     config_content = yaml.dump(cli_cfg, default_flow_style=False, sort_keys=False)
 
