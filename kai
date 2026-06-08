@@ -781,15 +781,26 @@ def cmd_setup(args):
     except Exception:
         pass
 
-    # Store GitHub token if provided (needed by lab managers to push user configs)
-    if getattr(args, "github_token", None):
+    # Store GitHub token — required for lab managers to push user configs via kai add-user
+    token = getattr(args, "github_token", None)
+    if not token and cfg.get("config_base_url") and cfg.get("role") == "lab-manager":
+        print()
+        print("This config has role: lab-manager and a config_base_url.")
+        print("A GitHub personal access token is required to push user configs (kai add-user).")
+        sys.stdout.write("GitHub token (ghp_..., blank to skip): ")
+        sys.stdout.flush()
+        try:
+            token = sys.stdin.readline().strip() or None
+        except (KeyboardInterrupt, EOFError):
+            token = None
+    if token:
         cred_path = os.path.join(_KAI_HOME, "credentials")
         try:
             with open(cred_path) as f:
                 creds = yaml.safe_load(f) or {}
         except FileNotFoundError:
             creds = {}
-        creds["github_token"] = args.github_token
+        creds["github_token"] = token
         with open(cred_path, "w") as f:
             yaml.dump(creds, f, default_flow_style=False, sort_keys=False)
         os.chmod(cred_path, 0o600)
