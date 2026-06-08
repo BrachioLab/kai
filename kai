@@ -223,7 +223,8 @@ def _git_push_config(owner, repo, branch, path, content, message):
 
 # Queue → KAI built-in priorityClassName
 QUEUE_PRIORITY_CLASS = {
-    "preemptible": "train",   # value 50, reclaimable — default queue
+    "preemptible": "train",   # value 50, reclaimable — exploratory queue
+    "default":     "train",   # same for now; will stay reclaimable until quota is set
     # machine-specific queues (carnaroli, jasmine, etc.) fall through to "build"
 }
 
@@ -433,7 +434,7 @@ def cmd_submit(args):
     if args.backoff_limit is not None:
         backoff = args.backoff_limit
     else:
-        backoff = 10 if args.queue == "preemptible" else 0
+        backoff = 10 if args.queue in ("preemptible", "default") else 0
 
     manifest = _build_manifest(
         name=name,
