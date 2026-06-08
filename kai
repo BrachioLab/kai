@@ -60,6 +60,7 @@ ROLE            = None
 PARENT_QUEUE    = None
 CONFIG_URL      = None   # Raw URL to fetch this user's config from GitHub
 CONFIG_BASE_URL = None   # Base URL for generating config URLs for new users
+QUEUE_NODES     = {}     # queue name → node hostname (client-side node selector)
 
 # Default output dir for generated configs (relative to this script)
 _CONFIGS_OUTPUT_DIR = os.path.join(_SCRIPT_DIR, "..", "05-access-control", "output", "configs")
@@ -68,7 +69,7 @@ _CONFIGS_OUTPUT_DIR = os.path.join(_SCRIPT_DIR, "..", "05-access-control", "outp
 def _load_config(explicit_path=None):
     """Load kai config file; update globals with its values."""
     global NAMESPACE, KUBECONFIG, DEFAULT_QUEUE, ALLOWED_QUEUES, ROLE, PARENT_QUEUE
-    global CONFIG_URL, CONFIG_BASE_URL
+    global CONFIG_URL, CONFIG_BASE_URL, QUEUE_NODES
 
     paths = []
     if explicit_path:
@@ -106,6 +107,8 @@ def _load_config(explicit_path=None):
         CONFIG_URL = cfg["config_url"]
     if cfg.get("config_base_url"):
         CONFIG_BASE_URL = cfg["config_base_url"]
+    if cfg.get("queue_nodes"):
+        QUEUE_NODES = dict(cfg["queue_nodes"])
 
 
 def _read_github_token():
@@ -297,6 +300,8 @@ def cmd_submit(args):
     node_selector = {}
     if args.node:
         node_selector["kubernetes.io/hostname"] = args.node
+    elif QUEUE_NODES.get(args.queue):
+        node_selector["kubernetes.io/hostname"] = QUEUE_NODES[args.queue]
     if args.gpu_type:
         label = GPU_TYPE_MAP.get(args.gpu_type.lower())
         if not label:
@@ -640,6 +645,8 @@ def cmd_add_user(args):
     if CONFIG_BASE_URL:
         cli_cfg["config_url"]      = f"{CONFIG_BASE_URL}/{NAMESPACE}-{args.name}.yaml"
         cli_cfg["config_base_url"] = CONFIG_BASE_URL
+    if QUEUE_NODES:
+        cli_cfg["queue_nodes"] = dict(QUEUE_NODES)
 
     # Write config to the tracked output dir (for git) if it exists, else cwd
     configs_dir = os.path.normpath(_CONFIGS_OUTPUT_DIR)
@@ -908,6 +915,27 @@ def cmd_self_update(args):
 
 # ── queue management ───────────────────────────────────────────────────────────
 
+def _config_update_queue_node(queue_name, node):
+    """Add or remove a queue→node mapping in ~/.kai/config.yaml. Pass node=None to remove."""
+    config_path = os.path.join(_KAI_HOME, "config.yaml")
+    try:
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        cfg = {}
+    nodes = cfg.get("queue_nodes") or {}
+    if node is None:
+        nodes.pop(queue_name, None)
+    else:
+        nodes[queue_name] = node
+    if nodes:
+        cfg["queue_nodes"] = nodes
+    elif "queue_nodes" in cfg:
+        del cfg["queue_nodes"]
+    with open(config_path, "w") as f:
+        yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
+
+
 def cmd_queue(args):
     if args.queue_cmd == "list":
         _queue_list()
@@ -930,8 +958,9 @@ def _queue_list():
         prio   = spec.get("priority", "—")
         res    = spec.get("resources", {})
         quota  = res.get("gpu", {}).get("quota", "—")
-        rows.append((meta["name"], parent, str(prio), str(quota)))
-    _print_table(("NAME", "PARENT", "PRIORITY", "GPU-QUOTA"), rows)
+        node   = QUEUE_NODES.get(meta["name"], "—")
+        rows.append((meta["name"], parent, str(prio), str(quota), node))
+    _print_table(("NAME", "PARENT", "PRIORITY", "GPU-QUOTA", "NODE"), rows)
 
 def _queue_create(args):
     if ROLE not in ("lab-manager", None) and ROLE != "admin":
@@ -954,13 +983,25 @@ def _queue_create(args):
         },
     }
     kubectl_global("apply", "-f", "-", stdin_data=json.dumps(manifest))
-    print(f"queue/{args.name} created  [parent: {parent}  priority: {args.priority}  gpu-quota: {args.quota}]")
+    msg = f"queue/{args.name} created  [parent: {parent}  priority: {args.priority}  gpu-quota: {args.quota}]"
+    if args.node:
+        _config_update_queue_node(args.name, args.node)
+        msg += f"  node:{args.node}"
+        print(msg)
+        print(f"  → node selector saved to ~/.kai/config.yaml")
+        print(f"  → Re-run 'kai add-user' for existing users and push to distribute")
+    else:
+        print(msg)
 
 def _queue_delete(args):
     if ROLE not in ("lab-manager", None) and ROLE != "admin":
         _die("Only lab-managers can delete queues.")
     kubectl_global("delete", "queue", args.name)
-    print(f"queue/{args.name} deleted")
+    if args.name in QUEUE_NODES:
+        _config_update_queue_node(args.name, None)
+        print(f"queue/{args.name} deleted  (node selector removed from config)")
+    else:
+        print(f"queue/{args.name} deleted")
 
 # ── utilities ──────────────────────────────────────────────────────────────────
 
@@ -1181,6 +1222,8 @@ def main():
                     help="Priority (default: 100; 0 = preemptible)")
     qp.add_argument("--parent", metavar="QUEUE",
                     help="Parent queue name (default: from config file)")
+    qp.add_argument("--node", metavar="HOSTNAME",
+                    help="Pin all jobs submitted to this queue to a specific node")
     qp = qsub.add_parser("delete", help="Delete a queue")
     qp.add_argument("name", metavar="NAME", help="Queue name")
     p.set_defaults(func=cmd_queue)
