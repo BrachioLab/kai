@@ -87,7 +87,7 @@ def _load_config(explicit_path=None):
                 print(f"warning: could not read config {p}: {e}", file=sys.stderr)
             break
 
-    if cfg.get("namespace"):
+    if cfg.get("namespace") and not os.environ.get("KAI_NAMESPACE"):
         NAMESPACE = cfg["namespace"]
     if cfg.get("kubeconfig"):
         KUBECONFIG = os.path.expanduser(cfg["kubeconfig"])
