@@ -711,9 +711,13 @@ def _build_and_push_config(username, role, queue, lab_name, commit_msg=None):
 def cmd_push_config(args):
     """Push an updated CLI config for an existing user — no Kubernetes changes."""
     lab_name = PARENT_QUEUE or NAMESPACE
+    username = args.name or os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    if not username:
+        _die("Could not determine username — use --name to specify explicitly.")
     queue = getattr(args, "queue", None) or DEFAULT_QUEUE
-    _build_and_push_config(args.name, args.role, queue, lab_name,
-                           commit_msg=f"update {args.name} in {NAMESPACE}")
+    role = args.role or ROLE or "researcher"
+    _build_and_push_config(username, role, queue, lab_name,
+                           commit_msg=f"update {username} in {NAMESPACE}")
 
 
 # ── add-user ───────────────────────────────────────────────────────────────────
@@ -1354,10 +1358,10 @@ def main():
 
     # ── push-config ──
     p = sub.add_parser("push-config", help="Push updated CLI config for an existing user (no Kubernetes changes)")
-    p.add_argument("--name", required=True, metavar="USERNAME",
-                   help="Username to update")
-    p.add_argument("--role", choices=["researcher", "lab-manager"], default="researcher",
-                   help="Role (default: researcher)")
+    p.add_argument("--name", metavar="USERNAME", default=None,
+                   help="Username to update (default: current OS user)")
+    p.add_argument("--role", choices=["researcher", "lab-manager"], default=None,
+                   help="Role (default: your own role for self-updates, researcher for others)")
     p.add_argument("--queue", metavar="QUEUE",
                    help="Default queue (default from config)")
     p.set_defaults(func=cmd_push_config)
