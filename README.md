@@ -10,34 +10,23 @@ CLI for submitting and managing jobs on a [KAI Scheduler](https://github.com/run
 sh -c "$(curl -fsSL https://raw.githubusercontent.com/BrachioLab/kai/main/install.sh)"
 ```
 
-This downloads `kai` to `~/.kai/bin/kai` and adds `~/.kai/bin` to your PATH in `~/.bashrc` or `~/.zshrc`.
+You will be prompted for the configs repository and your lab namespace. The installer checks that your account exists in the repo before proceeding — if it doesn't, ask your lab manager to run `kai add-user --name <you>` first.
+
+The installer also sets up automatic update checks on every login.
 
 Then start a new shell (or run `source ~/.bashrc` / `source ~/.zshrc`) so `kai` is on your PATH.
 
-### Step 2 — Get your credentials from the lab manager
+### Step 2 — Get your kubeconfig from the lab manager
 
-Your lab manager will send you two files:
-
-| File | How to receive it |
-|------|-------------------|
-| `<lab>-<you>.yaml` — your CLI config | Safe to share; can be sent over Slack, email, etc. |
-| `kai-kubeconfig-<you>.yaml` — your cluster credentials | **Keep this secret** — treat it like a password |
+Your lab manager will send you `kai-kubeconfig-<you>.yaml` via a secure channel (Slack DM, encrypted email, etc.). **Keep this secret — treat it like a password.**
 
 ### Step 3 — Set up kai
 
 ```sh
-kai setup <lab>-<you>.yaml kai-kubeconfig-<you>.yaml
+kai setup kai-kubeconfig-<you>.yaml
 ```
 
-This copies both files into `~/.kai/` and saves the URL that future config updates will be fetched from.
-
-### Step 4 — Enable automatic updates
-
-```sh
-kai install
-```
-
-This adds two lines to your shell rc file so that every time you open a new terminal, kai silently checks for updates to itself and to your config. If an update is available, it will ask before applying it.
+This installs your kubeconfig and fetches your CLI config automatically from the configs repo.
 
 That's it — you're ready to submit jobs.
 
@@ -80,7 +69,7 @@ kai queue list            # available queues and their GPU quotas
 
 ## Updates
 
-kai checks for updates automatically on every login (after `kai install`). You will be prompted before anything is applied. To check manually:
+kai checks for updates automatically on every login. You will be prompted before anything is applied. To check manually:
 
 ```sh
 kai update                # check for a config update

@@ -83,6 +83,9 @@ export PATH="${KAI_BIN}:${PATH}"
 printf '%s\n' "${CONFIGS_REPO_URL}" > "${KAI_HOME}/configs_repo"
 echo "✓ Configs repo → ${KAI_HOME}/configs_repo"
 
+# Add login hook now that kai is installed
+"${KAI_BIN}/kai" install
+
 echo ""
 echo "✓ kai installed to ${KAI_BIN}/kai"
 echo ""
@@ -90,5 +93,3 @@ echo "Next steps:"
 echo "  1. Start a new shell (or run: source ${RC})"
 echo "  2. Get your kubeconfig from your lab manager, then run:"
 echo "       kai setup <kai-kubeconfig-${USER}.yaml>"
-echo "  3. Enable automatic config updates on login:"
-echo "       kai install"
