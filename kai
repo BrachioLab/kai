@@ -1,0 +1,1185 @@
+#!/usr/bin/env python3
+"""
+kai — generic CLI for the KAI Scheduler.
+
+Usage:
+  kai setup CONFIG KUBECONFIG      Install config and kubeconfig files (first-time setup)
+  kai install                      Add auto-update hook to shell rc
+  kai update [--quiet]             Pull latest config from GitHub
+  kai check-update                 Apply any pending config update (called on login)
+  kai self-update                  Upgrade kai itself from GitHub
+  kai submit --image IMAGE [--gpu N] [--queue Q] [--node NODE] [-- CMD...]
+  kai list / kai pods / kai gpus
+  kai logs JOB [-f] / kai describe JOB / kai delete JOB...
+  kai exec JOB_OR_POD [-- CMD]
+  kai bash JOB_OR_POD              Open an interactive bash shell in a running job
+  kai add-user --name NAME [--role ROLE]
+  kai queue list / create / delete
+
+Environment:
+  KUBECONFIG         Path to kubeconfig
+  KAI_NAMESPACE      Override namespace
+  KAI_CONFIG         Override config file path
+  KAI_GITHUB_TOKEN   GitHub token for fetching configs from private repos
+"""
+
+import argparse
+import base64
+import json
+import os
+import shutil
+import subprocess
+import sys
+import textwrap
+import time
+import urllib.request
+import uuid
+import yaml
+from datetime import datetime, timezone
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+# User home directory for all kai files — mirrors ~/.oh-my-zsh layout
+_KAI_HOME = os.path.expanduser("~/.kai")
+
+# Namespace for all workloads.
+# Override with --namespace flag or KAI_NAMESPACE env var.
+NAMESPACE = os.environ.get("KAI_NAMESPACE", "")
+
+# Default kubeconfig: ../kubeconfig.yaml relative to this script
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_DEFAULT_KUBECONFIG = os.path.join(_SCRIPT_DIR, "..", "kubeconfig.yaml")
+KUBECONFIG = os.environ.get("KUBECONFIG", _DEFAULT_KUBECONFIG)
+
+# URL of the kai script itself in the public repo — used by self-update
+_KAI_SCRIPT_URL = "https://raw.githubusercontent.com/BrachioLab/kai/main/kai"
+
+# Populated from config file
+DEFAULT_QUEUE   = "members"
+ALLOWED_QUEUES  = None   # None = unrestricted (admin/no config file)
+ROLE            = None
+PARENT_QUEUE    = None
+CONFIG_URL      = None   # Raw URL to fetch this user's config from GitHub
+CONFIG_BASE_URL = None   # Base URL for generating config URLs for new users
+
+# Default output dir for generated configs (relative to this script)
+_CONFIGS_OUTPUT_DIR = os.path.join(_SCRIPT_DIR, "..", "05-access-control", "output", "configs")
+
+
+def _load_config(explicit_path=None):
+    """Load kai config file; update globals with its values."""
+    global NAMESPACE, KUBECONFIG, DEFAULT_QUEUE, ALLOWED_QUEUES, ROLE, PARENT_QUEUE
+    global CONFIG_URL, CONFIG_BASE_URL
+
+    paths = []
+    if explicit_path:
+        paths = [explicit_path]
+    elif os.environ.get("KAI_CONFIG"):
+        paths = [os.environ["KAI_CONFIG"]]
+    else:
+        paths = [
+            os.path.join(_KAI_HOME, "config.yaml"),
+        ]
+
+    cfg = {}
+    for p in paths:
+        if os.path.exists(p):
+            try:
+                with open(p) as f:
+                    cfg = yaml.safe_load(f) or {}
+            except Exception as e:
+                print(f"warning: could not read config {p}: {e}", file=sys.stderr)
+            break
+
+    if cfg.get("namespace"):
+        NAMESPACE = cfg["namespace"]
+    if cfg.get("kubeconfig"):
+        KUBECONFIG = os.path.expanduser(cfg["kubeconfig"])
+    if cfg.get("default_queue"):
+        DEFAULT_QUEUE = cfg["default_queue"]
+    if cfg.get("allowed_queues") is not None:
+        ALLOWED_QUEUES = list(cfg["allowed_queues"])
+    if cfg.get("role"):
+        ROLE = cfg["role"]
+    if cfg.get("parent_queue"):
+        PARENT_QUEUE = cfg["parent_queue"]
+    if cfg.get("config_url"):
+        CONFIG_URL = cfg["config_url"]
+    if cfg.get("config_base_url"):
+        CONFIG_BASE_URL = cfg["config_base_url"]
+
+
+def _read_github_token():
+    """Read GitHub token from credentials file, for fetching configs from private repos."""
+    cred_path = os.path.join(_KAI_HOME, "credentials")
+    try:
+        with open(cred_path) as f:
+            creds = yaml.safe_load(f) or {}
+        return creds.get("github_token")
+    except FileNotFoundError:
+        return None
+
+# Queue → KAI built-in priorityClassName
+QUEUE_PRIORITY_CLASS = {
+    "members":     "build",   # value 100, non-preemptible
+    "preemptible": "train",   # value 50,  reclaimable
+}
+
+# Friendly GPU type shorthand → nvidia.com/gpu.product label value
+GPU_TYPE_MAP = {
+    "h200":      "NVIDIA-H200-NVL",
+    "6000":      "NVIDIA-RTX-PRO-6000-Blackwell-Workstation-Edition",
+    "blackwell": "NVIDIA-RTX-PRO-6000-Blackwell-Workstation-Edition",
+    "4090":      "NVIDIA-GeForce-RTX-4090",
+    "4000":      "NVIDIA-RTX-4000-Ada-Generation",
+    "ada":       "NVIDIA-RTX-4000-Ada-Generation",
+}
+
+# GPU node inventory — used by the gpus command
+GPU_NODES = {
+    "carnaroli":   {"name": "H200 NVL",         "mem_gb": 140, "count": 4},
+    "jasmine":     {"name": "RTX PRO 6000 BW",  "mem_gb": 96,  "count": 2},
+    "hylian":      {"name": "RTX 4090",         "mem_gb": 24,  "count": 3},
+    "koshihikari": {"name": "RTX 4000 Ada",     "mem_gb": 20,  "count": 3},
+}
+
+# ── kubectl helpers ────────────────────────────────────────────────────────────
+
+def kubectl(*args, capture=True, check=True, stdin_data=None):
+    cmd = ["kubectl", "--kubeconfig", KUBECONFIG, "--namespace", NAMESPACE] + list(args)
+    if capture:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, check=False,
+            input=stdin_data,
+        )
+        if check and result.returncode != 0:
+            print(result.stderr.strip(), file=sys.stderr)
+            sys.exit(result.returncode)
+        return result
+    else:
+        subprocess.run(cmd, check=False, input=stdin_data, text=bool(stdin_data))
+        return None
+
+def kubectl_global(*args, capture=True, check=True, stdin_data=None):
+    """kubectl without --namespace, for cluster-scoped resources (e.g. Queue CRDs)."""
+    cmd = ["kubectl", "--kubeconfig", KUBECONFIG] + list(args)
+    if capture:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, check=False,
+            input=stdin_data,
+        )
+        if check and result.returncode != 0:
+            print(result.stderr.strip(), file=sys.stderr)
+            sys.exit(result.returncode)
+        return result
+    else:
+        subprocess.run(cmd, check=False, input=stdin_data, text=bool(stdin_data))
+        return None
+
+# ── Manifest builder ───────────────────────────────────────────────────────────
+
+def _unique_name(prefix="job"):
+    return f"{prefix}-{uuid.uuid4().hex[:6]}"
+
+def _build_resources(gpu_count, cpu_req, mem_req):
+    if gpu_count > 0:
+        cpu_req  = cpu_req  or f"{gpu_count * 4}"
+        mem_req  = mem_req  or f"{gpu_count * 32}Gi"
+    else:
+        cpu_req  = cpu_req  or "2"
+        mem_req  = mem_req  or "4Gi"
+
+    resources = {"requests": {"cpu": cpu_req, "memory": mem_req}}
+    if gpu_count > 0:
+        resources["limits"] = {"nvidia.com/gpu": str(gpu_count)}
+    return resources
+
+def _build_manifest(*, name, image, command, gpu_count, cpu_req, mem_req,
+                    queue, node_selector, backoff_limit, envs, interactive,
+                    volumes, ports, workdir, large_shm, attach):
+    pod_labels = {
+        "kai.scheduler/queue": queue,
+        "priorityClassName":   QUEUE_PRIORITY_CLASS.get(queue, "build"),
+    }
+
+    container = {
+        "name":      "work",
+        "image":     image,
+        "resources": _build_resources(gpu_count, cpu_req, mem_req),
+    }
+
+    if interactive:
+        container["command"] = ["sleep", "infinity"]
+    elif command:
+        container["command"] = command[:1]
+        if len(command) > 1:
+            container["args"] = command[1:]
+
+    if envs:
+        container["env"] = [{"name": k, "value": v} for k, v in envs.items()]
+
+    if workdir:
+        container["workingDir"] = workdir
+
+    if ports:
+        container["ports"] = [{"containerPort": int(p)} for p in ports]
+
+    # --attach: keep stdin and tty open so kubectl attach -it works
+    if attach:
+        container["stdin"] = True
+        container["tty"]   = True
+
+    # Build hostPath volumes from --volume HOST:CONTAINER[:ro]
+    vol_defs   = []
+    vol_mounts = []
+    for i, vol in enumerate(volumes or []):
+        parts     = vol.split(":")
+        if len(parts) < 2:
+            _die(f"Invalid --volume '{vol}': expected HOST_PATH:CONTAINER_PATH[:ro]")
+        host_path   = parts[0]
+        mount_path  = parts[1]
+        read_only   = len(parts) > 2 and parts[2] == "ro"
+        vol_name    = f"vol{i}"
+        vol_defs.append({"name": vol_name, "hostPath": {"path": host_path}})
+        mount = {"name": vol_name, "mountPath": mount_path}
+        if read_only:
+            mount["readOnly"] = True
+        vol_mounts.append(mount)
+
+    # --large-shm: replace /dev/shm with an in-memory emptyDir (no size cap)
+    if large_shm:
+        vol_defs.append({"name": "dshm", "emptyDir": {"medium": "Memory"}})
+        vol_mounts.append({"name": "dshm", "mountPath": "/dev/shm"})
+
+    if vol_mounts:
+        container["volumeMounts"] = vol_mounts
+
+    pod_spec = {
+        "schedulerName": "kai-scheduler",
+        "restartPolicy": "Never",
+        "containers":    [container],
+    }
+    if node_selector:
+        pod_spec["nodeSelector"] = node_selector
+    if vol_defs:
+        pod_spec["volumes"] = vol_defs
+
+    if interactive:
+        return {
+            "apiVersion": "v1",
+            "kind":       "Pod",
+            "metadata":   {"name": name, "namespace": NAMESPACE, "labels": pod_labels},
+            "spec":       pod_spec,
+        }
+    else:
+        return {
+            "apiVersion": "batch/v1",
+            "kind":       "Job",
+            "metadata":   {"name": name, "namespace": NAMESPACE},
+            "spec": {
+                "backoffLimit": backoff_limit,
+                "template": {
+                    "metadata": {"labels": pod_labels},
+                    "spec":     pod_spec,
+                },
+            },
+        }
+
+# ── submit ─────────────────────────────────────────────────────────────────────
+
+def cmd_submit(args):
+    name = args.name or _unique_name()
+
+    # Enforce allowed_queues from config file
+    if ALLOWED_QUEUES is not None and args.queue not in ALLOWED_QUEUES:
+        _die(f"Queue '{args.queue}' is not in your allowed queues: {', '.join(ALLOWED_QUEUES)}")
+
+    # Resolve nodeSelector
+    node_selector = {}
+    if args.node:
+        node_selector["kubernetes.io/hostname"] = args.node
+    if args.gpu_type:
+        label = GPU_TYPE_MAP.get(args.gpu_type.lower())
+        if not label:
+            _die(f"Unknown GPU type '{args.gpu_type}'. Valid: {', '.join(GPU_TYPE_MAP)}")
+        node_selector["nvidia.com/gpu.product"] = label
+
+    # Parse --env KEY=VALUE
+    envs = {}
+    for e in args.env or []:
+        if "=" not in e:
+            _die(f"Invalid --env '{e}': expected KEY=VALUE")
+        k, v = e.split("=", 1)
+        envs[k] = v
+
+    # backoffLimit default: members run once; preemptible survives evictions
+    if args.backoff_limit is not None:
+        backoff = args.backoff_limit
+    else:
+        backoff = 0 if args.queue == "members" else 10
+
+    manifest = _build_manifest(
+        name=name,
+        image=args.image,
+        command=args.command or [],
+        gpu_count=args.gpu,
+        cpu_req=args.cpu,
+        mem_req=args.memory,
+        queue=args.queue,
+        node_selector=node_selector,
+        backoff_limit=backoff,
+        envs=envs,
+        interactive=args.interactive,
+        volumes=args.volume or [],
+        ports=args.port or [],
+        workdir=args.workdir,
+        large_shm=args.large_shm,
+        attach=args.attach,
+    )
+
+    kubectl("apply", "-f", "-", capture=True, stdin_data=json.dumps(manifest))
+
+    if args.interactive:
+        print(f"Waiting for pod {name} to be ready...")
+        _wait_for_pod(name)
+        print(f"Connected to {name}  (exit or Ctrl-D to quit)\n")
+        kubectl("exec", "-it", name, "--", "bash", capture=False)
+        answer = input(f"\nDelete pod '{name}'? [Y/n] ").strip().lower()
+        if answer in ("", "y", "yes"):
+            kubectl("delete", "pod", name, capture=True)
+            print(f"Deleted pod {name}.")
+    elif args.attach:
+        print(f"Waiting for job {name} to start...")
+        pod = _wait_for_job_pod(name)
+        print(f"Attaching to {pod}  (exit shell or Ctrl-P Ctrl-Q to detach)\n")
+        kubectl("attach", "-it", pod, capture=False)
+        print(f"\nJob '{name}' still exists. To remove: kai delete {name}")
+    else:
+        gpu_str = f"{args.gpu} GPU{'s' if args.gpu != 1 else ''}" if args.gpu else "CPU only"
+        print(f"Submitted {name}  [{args.queue}] [{gpu_str}]")
+        print(f"  kai logs {name} -f    # stream logs")
+        print(f"  kai delete {name}     # cancel")
+
+def _wait_for_pod(name, timeout=120):
+    """Wait for a Pod (by pod name) to be Running — used by --interactive mode."""
+    deadline = time.time() + timeout
+    dots = 0
+    while time.time() < deadline:
+        r = kubectl("get", "pod", name, "-o", "jsonpath={.status.phase}",
+                    capture=True, check=False)
+        phase = r.stdout.strip()
+        if phase == "Running":
+            return
+        if phase in ("Failed", "Succeeded"):
+            _die(f"Pod {name} entered phase '{phase}' before interactive session could start.")
+        print("." * (dots % 4 + 1), end="\r", flush=True)
+        dots += 1
+        time.sleep(2)
+    _die(f"Timed out waiting for pod {name} to start.")
+
+def _wait_for_job_pod(job_name, timeout=120):
+    """Wait for a Job's pod to be Running; return the pod name — used by --attach mode."""
+    deadline = time.time() + timeout
+    dots = 0
+    while time.time() < deadline:
+        r = kubectl("get", "pods", "-l", f"job-name={job_name}",
+                    "-o", "jsonpath={.items[0].status.phase} {.items[0].metadata.name}",
+                    capture=True, check=False)
+        parts = r.stdout.strip().split()
+        if len(parts) == 2:
+            phase, pod_name = parts
+            if phase == "Running":
+                return pod_name
+            if phase in ("Failed", "Succeeded"):
+                _die(f"Pod for job {job_name} entered phase '{phase}' before attach could start.")
+        print("." * (dots % 4 + 1), end="\r", flush=True)
+        dots += 1
+        time.sleep(2)
+    _die(f"Timed out waiting for job {job_name} pod to start.")
+
+# ── port-forward ───────────────────────────────────────────────────────────────
+
+def _resolve_pod(name):
+    """Return a pod name, resolving a job name to its active pod if needed."""
+    r = kubectl("get", "pod", name, capture=True, check=False)
+    if r.returncode == 0:
+        return name
+    r2 = kubectl("get", "pods", "-l", f"job-name={name}",
+                 "-o", "jsonpath={.items[0].metadata.name}", capture=True, check=False)
+    pod = r2.stdout.strip()
+    if pod:
+        return pod
+    _die(f"No running pod found for '{name}'")
+
+def cmd_port_forward(args):
+    pod = _resolve_pod(args.target)
+    print(f"Forwarding to pod/{pod}  (Ctrl-C to stop)")
+    kubectl("port-forward", f"pod/{pod}", *args.ports, capture=False, check=False)
+
+# ── list ───────────────────────────────────────────────────────────────────────
+
+def cmd_list(args):
+    r = kubectl("get", "jobs", "-o", "json", capture=True)
+    items = json.loads(r.stdout).get("items", [])
+    if not items:
+        print(f"No jobs in namespace {NAMESPACE}.")
+        return
+
+    rows = []
+    for job in items:
+        meta   = job["metadata"]
+        spec   = job["spec"]
+        status = job.get("status", {})
+
+        name  = meta["name"]
+        queue = (spec.get("template", {})
+                     .get("metadata", {})
+                     .get("labels", {})
+                     .get("kai.scheduler/queue", "—"))
+
+        gpus = (spec.get("template", {})
+                    .get("spec", {})
+                    .get("containers", [{}])[0]
+                    .get("resources", {})
+                    .get("limits", {})
+                    .get("nvidia.com/gpu", "0"))
+        gpu_col = gpus if gpus != "0" else "—"
+
+        conds = status.get("conditions", [])
+        if   any(c["type"] == "Complete" and c["status"] == "True" for c in conds): state = "Complete"
+        elif any(c["type"] == "Failed"   and c["status"] == "True" for c in conds): state = "Failed"
+        elif status.get("active", 0) > 0:                                           state = "Running"
+        else:                                                                        state = "Pending"
+
+        done = f"{status.get('succeeded', 0)}/{spec.get('completions', 1)}"
+        age  = _fmt_age(meta.get("creationTimestamp", ""))
+
+        rows.append((name, queue, gpu_col, state, done, age))
+
+    _print_table(("NAME", "QUEUE", "GPUS", "STATUS", "DONE", "AGE"), rows)
+
+# ── pods ───────────────────────────────────────────────────────────────────────
+
+def cmd_pods(args):
+    kubectl("get", "pods", "-o", "wide", capture=False)
+
+# ── logs ───────────────────────────────────────────────────────────────────────
+
+def cmd_logs(args):
+    flags = ["-f"] if args.follow else []
+    kubectl("logs", "-l", f"job-name={args.job}",
+            "--tail", str(args.tail), *flags, capture=False, check=False)
+
+# ── delete ─────────────────────────────────────────────────────────────────────
+
+def cmd_delete(args):
+    for name in args.names:
+        r = kubectl("delete", "job", name, "--ignore-not-found", capture=True, check=False)
+        if "deleted" in r.stdout:
+            print(f"job/{name} deleted")
+            continue
+        r2 = kubectl("delete", "pod", name, "--ignore-not-found", capture=True, check=False)
+        if "deleted" in r2.stdout:
+            print(f"pod/{name} deleted")
+        else:
+            print(f"not found: {name}")
+
+# ── describe ───────────────────────────────────────────────────────────────────
+
+def cmd_describe(args):
+    r = kubectl("describe", "job", args.name, capture=True, check=False)
+    if r.returncode == 0:
+        print(r.stdout)
+    else:
+        kubectl("describe", "pod", args.name, capture=False, check=False)
+
+# ── exec ───────────────────────────────────────────────────────────────────────
+
+def cmd_exec(args):
+    cmd  = args.command or ["bash"]
+    pod  = _resolve_pod(args.pod)
+    tty_flags = ["-it"] if sys.stdin.isatty() else ["-i"]
+    kubectl("exec", *tty_flags, pod, "--", *cmd, capture=False, check=False)
+
+def cmd_bash(args):
+    """Open an interactive bash shell in a running job (equivalent to runai bash)."""
+    pod = _resolve_pod(args.pod)
+    kubectl("exec", "-it", pod, "--", "bash", capture=False, check=False)
+
+# ── gpus ───────────────────────────────────────────────────────────────────────
+
+def cmd_gpus(args):
+    r = kubectl("get", "pods", "-o", "json", capture=True)
+    pods = json.loads(r.stdout).get("items", [])
+
+    # Count GPU requests for Running/Pending pods per node
+    allocated = {}
+    for pod in pods:
+        phase    = pod.get("status", {}).get("phase", "")
+        node     = pod.get("spec", {}).get("nodeName") or "_pending"
+        if phase not in ("Running", "Pending"):
+            continue
+        for c in pod.get("spec", {}).get("containers", []):
+            gpus = int(c.get("resources", {}).get("limits", {}).get("nvidia.com/gpu", 0))
+            if gpus:
+                allocated[node] = allocated.get(node, 0) + gpus
+
+    rows = []
+    total_count = total_used = 0
+    for node, info in GPU_NODES.items():
+        used  = allocated.get(node, 0)
+        free  = info["count"] - used
+        rows.append((
+            node,
+            f"{info['name']} ({info['mem_gb']}GB)",
+            str(info["count"]),
+            str(used),
+            str(free),
+        ))
+        total_count += info["count"]
+        total_used  += used
+
+    _print_table(
+        ("NODE", "GPU", "TOTAL", "USED", "FREE"),
+        rows,
+        footer=("TOTAL", "", str(total_count), str(total_used), str(total_count - total_used)),
+    )
+
+# ── add-user ───────────────────────────────────────────────────────────────────
+
+def cmd_status(args):
+    """Show all resources in the namespace."""
+    kubectl("get", "all", "-n", NAMESPACE, capture=False)
+
+
+def cmd_add_user(args):
+    """Create a new user: SA + token + RoleBinding, then write kubeconfig + CLI config locally."""
+    # Read cluster server + CA from the current kubeconfig
+    try:
+        with open(os.path.expanduser(KUBECONFIG)) as f:
+            kc = yaml.safe_load(f)
+        cluster = kc["clusters"][0]["cluster"]
+        kube_server = cluster["server"]
+        kube_ca     = cluster["certificate-authority-data"]
+    except Exception as e:
+        _die(f"Could not read cluster info from {KUBECONFIG}: {e}")
+
+    lab_name = PARENT_QUEUE or NAMESPACE
+
+    # Create ServiceAccount
+    kubectl("apply", "-f", "-", stdin_data=json.dumps({
+        "apiVersion": "v1",
+        "kind": "ServiceAccount",
+        "metadata": {"name": args.name, "namespace": NAMESPACE},
+    }))
+
+    # Create long-lived token Secret
+    kubectl("apply", "-f", "-", stdin_data=json.dumps({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": f"{args.name}-token",
+            "namespace": NAMESPACE,
+            "annotations": {"kubernetes.io/service-account.name": args.name},
+        },
+        "type": "kubernetes.io/service-account-token",
+    }))
+
+    # Wait for the token controller to populate the secret
+    print("Waiting for token", end="", flush=True)
+    deadline = time.time() + 60
+    sa_token = None
+    while time.time() < deadline:
+        r = kubectl("get", "secret", f"{args.name}-token", "-o", "json", capture=True, check=False)
+        if r.returncode == 0:
+            raw = json.loads(r.stdout).get("data", {}).get("token")
+            if raw:
+                sa_token = base64.b64decode(raw).decode()
+                break
+        print(".", end="", flush=True)
+        time.sleep(2)
+    print()
+    if not sa_token:
+        _die(f"Timed out waiting for token for {args.name}")
+
+    # Create RoleBinding
+    kubectl("apply", "-f", "-", stdin_data=json.dumps({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "RoleBinding",
+        "metadata": {"name": f"{args.name}-binding", "namespace": NAMESPACE},
+        "subjects": [{"kind": "ServiceAccount", "name": args.name, "namespace": NAMESPACE}],
+        "roleRef": {"kind": "Role", "name": args.role, "apiGroup": "rbac.authorization.k8s.io"},
+    }))
+
+    # Write kubeconfig — user places this at ~/.kai/kubeconfig.yaml
+    context_name = f"{NAMESPACE}-{args.name}"
+    kubeconfig_out = {
+        "apiVersion": "v1",
+        "kind": "Config",
+        "clusters": [{"cluster": {"certificate-authority-data": kube_ca, "server": kube_server},
+                      "name": f"{lab_name}-cluster"}],
+        "contexts": [{"context": {"cluster": f"{lab_name}-cluster", "namespace": NAMESPACE, "user": args.name},
+                      "name": context_name}],
+        "current-context": context_name,
+        "users": [{"name": args.name, "user": {"token": sa_token}}],
+    }
+    kubeconfig_file = f"kai-kubeconfig-{args.name}.yaml"
+    with open(kubeconfig_file, "w") as f:
+        yaml.dump(kubeconfig_out, f, default_flow_style=False, sort_keys=False)
+    os.chmod(kubeconfig_file, 0o600)
+
+    # Write CLI config — placed at ~/.kai/config.yaml on user's machine
+    queue = getattr(args, "queue", None) or DEFAULT_QUEUE
+    cli_cfg = {
+        "namespace":   NAMESPACE,
+        "default_queue": queue,
+        "role":        args.role,
+        "kubeconfig":  "~/.kai/kubeconfig.yaml",
+    }
+    if args.role == "lab-manager":
+        cli_cfg["parent_queue"] = lab_name
+    if CONFIG_BASE_URL:
+        cli_cfg["config_url"]      = f"{CONFIG_BASE_URL}/{NAMESPACE}-{args.name}.yaml"
+        cli_cfg["config_base_url"] = CONFIG_BASE_URL
+
+    # Write config to the tracked output dir (for git) if it exists, else cwd
+    configs_dir = os.path.normpath(_CONFIGS_OUTPUT_DIR)
+    if os.path.isdir(configs_dir):
+        config_file = os.path.join(configs_dir, f"{NAMESPACE}-{args.name}.yaml")
+        config_file_display = os.path.relpath(config_file)
+    else:
+        config_file = f"kai-config-{args.name}.yaml"
+        config_file_display = config_file
+    with open(config_file, "w") as f:
+        yaml.dump(cli_cfg, f, default_flow_style=False, sort_keys=False)
+
+    print(f"\n✓  {args.name}  [{args.role}]  namespace:{NAMESPACE}  queue:{queue}")
+    print(f"\n   kubeconfig : {kubeconfig_file}  ← keep secret, share via secure channel")
+    print(f"   cli config : {config_file_display}  ← safe to share")
+    print()
+    print("   1. Commit and push the config so the user can auto-update:")
+    print(f"        git add {config_file_display}")
+    print(f"        git commit -m 'add {args.name} to {NAMESPACE}'")
+    print(f"        git push")
+    print()
+    print("   2. Share the kubeconfig securely (Slack DM, encrypted email, etc.)")
+    print()
+    print(f"   3. User runs on their machine:")
+    print(f"        kai setup {config_file_display} {kubeconfig_file}")
+    print(f"        kai install")
+
+    if args.role == "lab-manager":
+        crb = f"{NAMESPACE}-{args.name}-queue-manager"
+        sa  = f"{NAMESPACE}:{args.name}"
+        print()
+        print("  !! ADMIN STEP REQUIRED ".ljust(71, "!"))
+        print("  Lab managers need a ClusterRoleBinding to manage queues.")
+        print("  This cannot be granted with a lab-manager kubeconfig.")
+        print()
+        print("  An admin must run:")
+        print(f"    kubectl create clusterrolebinding {crb} \\")
+        print(f"      --clusterrole=lab-manager-queues \\")
+        print(f"      --serviceaccount={sa}")
+        print()
+        print("  Without this the user can submit jobs but not create/delete queues.")
+        print("  " + "!" * 69)
+
+# ── setup / update / install ──────────────────────────────────────────────────
+
+def cmd_setup(args):
+    """Install kubeconfig and CLI config from files into ~/.kai/."""
+    os.makedirs(_KAI_HOME, mode=0o700, exist_ok=True)
+
+    kubeconfig_dest = os.path.join(_KAI_HOME, "kubeconfig.yaml")
+    shutil.copy2(args.kubeconfig_file, kubeconfig_dest)
+    os.chmod(kubeconfig_dest, 0o600)
+    print(f"✓ kubeconfig → {kubeconfig_dest}")
+
+    config_dest = os.path.join(_KAI_HOME, "config.yaml")
+    shutil.copy2(args.config_file, config_dest)
+    print(f"✓ config     → {config_dest}")
+
+    # Persist config_url in a separate file so kai update survives config rewrites
+    try:
+        with open(args.config_file) as f:
+            cfg = yaml.safe_load(f) or {}
+        url = cfg.get("config_url")
+        if url:
+            url_file = os.path.join(_KAI_HOME, "config_url")
+            with open(url_file, "w") as f:
+                f.write(url.strip() + "\n")
+            print(f"✓ config_url → {url_file}")
+    except Exception:
+        pass
+
+    print()
+    print("Run 'kai install' to enable automatic config updates on login.")
+
+
+def _fetch_config_update():
+    """Fetch latest config from config_url. Returns (new_content, current_content) or (None, None) on error/no-change."""
+    url = None
+    url_file = os.path.join(_KAI_HOME, "config_url")
+    try:
+        with open(url_file) as f:
+            url = f.read().strip() or None
+    except FileNotFoundError:
+        pass
+    if not url:
+        url = CONFIG_URL
+    if not url:
+        return None, None
+
+    headers = {}
+    token = os.environ.get("KAI_GITHUB_TOKEN") or _read_github_token()
+    if token:
+        headers["Authorization"] = f"token {token}"
+
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            new_content = resp.read().decode()
+    except Exception:
+        return None, None
+
+    config_path = os.path.join(_KAI_HOME, "config.yaml")
+    try:
+        with open(config_path) as f:
+            current = f.read()
+    except FileNotFoundError:
+        current = ""
+
+    return new_content, current
+
+
+def cmd_update(args):
+    """Fetch latest config from config_url.
+
+    --quiet: write to ~/.kai/config.yaml.pending (applied on next login via check-update).
+    normal:  apply immediately.
+    """
+    quiet = getattr(args, "quiet", False)
+
+    url_file = os.path.join(_KAI_HOME, "config_url")
+    has_url = os.path.exists(url_file) or bool(CONFIG_URL)
+    if not has_url:
+        if not quiet:
+            print("kai: no config_url set — nothing to update", file=sys.stderr)
+        return
+
+    new_content, current = _fetch_config_update()
+    if new_content is None:
+        if not quiet:
+            print("kai: update failed or no config_url set", file=sys.stderr)
+        return
+
+    if new_content.strip() == current.strip():
+        if not quiet:
+            print("kai config is up to date")
+        return
+
+    if quiet:
+        # Write to pending file; user will be prompted on next login by check-update
+        pending = os.path.join(_KAI_HOME, "config.yaml.pending")
+        os.makedirs(_KAI_HOME, mode=0o700, exist_ok=True)
+        with open(pending, "w") as f:
+            f.write(new_content)
+    else:
+        config_path = os.path.join(_KAI_HOME, "config.yaml")
+        os.makedirs(_KAI_HOME, mode=0o700, exist_ok=True)
+        with open(config_path, "w") as f:
+            f.write(new_content)
+        print("✓ kai config updated")
+
+
+def cmd_check_update(args):
+    """Apply any pending config update, prompting the user first (oh-my-zsh style)."""
+    pending = os.path.join(_KAI_HOME, "config.yaml.pending")
+    if not os.path.exists(pending):
+        return
+
+    config_path = os.path.join(_KAI_HOME, "config.yaml")
+    try:
+        with open(pending) as f:
+            new_content = f.read()
+        try:
+            with open(config_path) as f:
+                current = f.read()
+        except FileNotFoundError:
+            current = ""
+        if new_content.strip() == current.strip():
+            os.unlink(pending)
+            return
+    except Exception:
+        return
+
+    print()
+    print("[kai] A config update is available.")
+    sys.stdout.write("[kai] Would you like to apply it? [Y/n] ")
+    sys.stdout.flush()
+    try:
+        answer = sys.stdin.readline().strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return
+
+    if answer in ("", "y", "yes"):
+        shutil.move(pending, config_path)
+        print("[kai] Config updated.")
+    else:
+        print("[kai] Skipped. Run 'kai update' to apply manually.")
+    print()
+
+
+def cmd_install(args):
+    """Add login hooks to ~/.bashrc or ~/.zshrc for config update prompts."""
+    marker = "kai check-update"
+    hook = (
+        "# kai: prompt for config updates on login\n"
+        "kai check-update 2>/dev/null\n"
+        "(kai update --quiet &) 2>/dev/null\n"
+    )
+
+    shell = os.path.basename(os.environ.get("SHELL", "bash"))
+    rc_path = os.path.expanduser("~/.zshrc" if shell == "zsh" else "~/.bashrc")
+
+    try:
+        with open(rc_path) as f:
+            content = f.read()
+    except FileNotFoundError:
+        content = ""
+
+    if marker in content:
+        print(f"Auto-update already configured in {rc_path}")
+        return
+
+    with open(rc_path, "a") as f:
+        f.write(f"\n{hook}")
+    print(f"✓ Auto-update hook added to {rc_path}")
+    print(f"  Takes effect in new shell sessions (or: source {rc_path})")
+
+
+def cmd_self_update(args):
+    """Download the latest kai script from GitHub and replace the current installation."""
+    kai_bin = os.path.join(_KAI_HOME, "bin", "kai")
+    if not os.path.exists(kai_bin):
+        _die(
+            "kai binary not found at ~/.kai/bin/kai\n"
+            "  Is kai installed via install.sh? If running from source, no self-update needed."
+        )
+
+    try:
+        req = urllib.request.Request(_KAI_SCRIPT_URL)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            new_script = resp.read()
+    except Exception as e:
+        _die(f"self-update failed: {e}")
+
+    with open(kai_bin, "wb") as f:
+        f.write(new_script)
+    os.chmod(kai_bin, 0o755)
+    print(f"✓ kai updated to latest version")
+
+
+# ── queue management ───────────────────────────────────────────────────────────
+
+def cmd_queue(args):
+    if args.queue_cmd == "list":
+        _queue_list()
+    elif args.queue_cmd == "create":
+        _queue_create(args)
+    elif args.queue_cmd == "delete":
+        _queue_delete(args)
+
+def _queue_list():
+    r = kubectl_global("get", "queues", "-o", "json")
+    items = json.loads(r.stdout).get("items", [])
+    if not items:
+        print("No queues found.")
+        return
+    rows = []
+    for q in items:
+        meta   = q["metadata"]
+        spec   = q.get("spec", {})
+        parent = spec.get("parentQueue", "—")
+        prio   = spec.get("priority", "—")
+        res    = spec.get("resources", {})
+        quota  = res.get("gpu", {}).get("quota", "—")
+        rows.append((meta["name"], parent, str(prio), str(quota)))
+    _print_table(("NAME", "PARENT", "PRIORITY", "GPU-QUOTA"), rows)
+
+def _queue_create(args):
+    if ROLE not in ("lab-manager", None) and ROLE != "admin":
+        _die("Only lab-managers can create queues.")
+    parent = args.parent or PARENT_QUEUE
+    if not parent:
+        _die("--parent required (or set parent_queue in config file)")
+    manifest = {
+        "apiVersion": "scheduling.run.ai/v2",
+        "kind": "Queue",
+        "metadata": {"name": args.name},
+        "spec": {
+            "parentQueue": parent,
+            "priority": args.priority,
+            "resources": {
+                "gpu":    {"quota": args.quota, "limit": -1, "overQuotaWeight": 1},
+                "cpu":    {"quota": -1,          "limit": -1, "overQuotaWeight": 1},
+                "memory": {"quota": -1,          "limit": -1, "overQuotaWeight": 1},
+            },
+        },
+    }
+    kubectl_global("apply", "-f", "-", stdin_data=json.dumps(manifest))
+    print(f"queue/{args.name} created  [parent: {parent}  priority: {args.priority}  gpu-quota: {args.quota}]")
+
+def _queue_delete(args):
+    if ROLE not in ("lab-manager", None) and ROLE != "admin":
+        _die("Only lab-managers can delete queues.")
+    kubectl_global("delete", "queue", args.name)
+    print(f"queue/{args.name} deleted")
+
+# ── utilities ──────────────────────────────────────────────────────────────────
+
+def _fmt_age(ts):
+    if not ts:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        s  = int((datetime.now(timezone.utc) - dt).total_seconds())
+        if s < 60:     return f"{s}s"
+        if s < 3600:   return f"{s // 60}m"
+        if s < 86400:  return f"{s // 3600}h"
+        return f"{s // 86400}d"
+    except Exception:
+        return "—"
+
+def _print_table(headers, rows, footer=None):
+    all_rows = [headers] + rows + ([footer] if footer else [])
+    col_w    = [max(len(str(r[i])) for r in all_rows) for i in range(len(headers))]
+    sep      = "  ".join("─" * w for w in col_w)
+
+    print("  ".join(str(h).ljust(col_w[i]) for i, h in enumerate(headers)))
+    print(sep)
+    for row in rows:
+        print("  ".join(str(v).ljust(col_w[i]) for i, v in enumerate(row)))
+    if footer:
+        print(sep)
+        print("  ".join(str(v).ljust(col_w[i]) for i, v in enumerate(footer)))
+
+def _die(msg):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+# ── argument parser ────────────────────────────────────────────────────────────
+
+def main():
+    global KUBECONFIG, NAMESPACE
+
+    # Load config file first (CLI flags override below)
+    _load_config()
+
+    parser = argparse.ArgumentParser(
+        prog="kai",
+        description="Submit and manage jobs on the KAI Scheduler cluster.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+        examples:
+          kai submit --image pytorch:24.01 --gpu 1 -- python train.py
+          kai submit --image pytorch:24.01 --gpu 2 --node carnaroli -- torchrun --nproc=2 train.py
+          kai submit --image pytorch:24.01 --gpu 1 --queue preemptible -- python explore.py
+          kai submit --image pytorch:24.01 --gpu 1 --gpu-type h200 --interactive
+          kai submit --image pytorch:24.01 --gpu 1 -v /data/datasets:/data -w /workspace -- python train.py
+          kai submit --image pytorch:24.01 --gpu 1 --large-shm -- python train.py
+          kai submit --image pytorch:24.01 --gpu 1 --attach -- /bin/bash -lc 'source ~/.bashrc; exec bash'
+          kai submit --image jupyter/base-notebook --port 8888 -- jupyter lab --ip=0.0.0.0
+          kai port-forward my-job 8888:8888
+          kai list
+          kai logs my-job -f
+          kai gpus
+          kai delete my-job
+          kai queue list
+          kai queue create --name fast --quota 4 --priority 200
+          kai queue delete fast
+        """),
+    )
+    parser.add_argument("--kubeconfig", metavar="PATH",
+                        help="Path to kubeconfig (overrides KUBECONFIG env var and config file)")
+    parser.add_argument("--namespace", metavar="NS",
+                        help="Kubernetes namespace (overrides KAI_NAMESPACE env var and config file)")
+    parser.add_argument("--config", metavar="PATH",
+                        help="Path to kai config file (default: ~/.kai/config.yaml)")
+    sub = parser.add_subparsers(dest="cmd", metavar="COMMAND")
+    sub.required = True
+
+    # ── submit ──
+    p = sub.add_parser("submit", help="Submit a job",
+                       formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--image", "-i", required=True, metavar="IMAGE",
+                   help="Container image")
+    p.add_argument("--name", "-n", metavar="NAME",
+                   help="Job name (auto-generated if omitted)")
+    p.add_argument("--gpu", "-g", type=int, default=0, metavar="N",
+                   help="Number of GPUs to request (default: 0)")
+    p.add_argument("--cpu", metavar="CORES",
+                   help="CPU request, e.g. '4' or '4000m' (default: 4 per GPU)")
+    p.add_argument("--memory", "--mem", metavar="SIZE",
+                   help="Memory request, e.g. '32Gi' (default: 32Gi per GPU)")
+    p.add_argument("--queue", "-q", default=None,
+                   help=f"Queue to submit to (default from config: {DEFAULT_QUEUE})")
+    p.add_argument("--node", metavar="HOSTNAME",
+                   help="Pin job to a specific node: carnaroli, jasmine, hylian, koshihikari")
+    p.add_argument("--gpu-type", metavar="TYPE",
+                   help="Pin to a GPU type: h200, 6000/blackwell, 4090, 4000/ada")
+    p.add_argument("--interactive", action="store_true",
+                   help="Start an interactive shell session (runs sleep+exec; creates a Pod)")
+    p.add_argument("--attach", action="store_true",
+                   help="Submit the job and attach stdin/tty to it (runs your -- command directly)")
+    p.add_argument("--large-shm", action="store_true",
+                   help="Replace /dev/shm with an in-memory emptyDir (no size cap; needed for PyTorch multiprocessing)")
+    p.add_argument("--backoff-limit", type=int, metavar="N",
+                   help="Retry limit (default: 0 for members, 10 for preemptible)")
+    p.add_argument("--env", action="append", metavar="KEY=VALUE",
+                   help="Set an environment variable (repeatable)")
+    p.add_argument("--volume", "-v", action="append", metavar="HOST:CONTAINER[:ro]",
+                   help="Mount a host directory into the container (repeatable)")
+    p.add_argument("--port", "-p", action="append", metavar="PORT",
+                   help="Declare a container port (repeatable; use port-forward to access)")
+    p.add_argument("--workdir", "-w", metavar="PATH",
+                   help="Set the working directory inside the container")
+    p.add_argument("command", nargs=argparse.REMAINDER, metavar="-- COMMAND [ARGS]",
+                   help="Command to run inside the container (after --)")
+    p.set_defaults(func=cmd_submit)
+
+    # ── port-forward ──
+    p = sub.add_parser("port-forward", aliases=["pf"],
+                       help="Forward a local port to a running job or pod")
+    p.add_argument("target", metavar="JOB_OR_POD",
+                   help="Job name (finds its active pod) or pod name")
+    p.add_argument("ports", nargs="+", metavar="[LOCAL:]REMOTE",
+                   help="Port mapping(s), e.g. 8888:8888 or just 8888")
+    p.set_defaults(func=cmd_port_forward)
+
+    # ── list / jobs ──
+    p = sub.add_parser("list", aliases=["jobs"], help="List all jobs")
+    p.set_defaults(func=cmd_list)
+
+    # ── pods ──
+    p = sub.add_parser("pods", help="List all pods")
+    p.set_defaults(func=cmd_pods)
+
+    # ── logs ──
+    p = sub.add_parser("logs", help="Stream logs from a job")
+    p.add_argument("job", metavar="JOB", help="Job name")
+    p.add_argument("-f", "--follow", action="store_true", help="Follow log output")
+    p.add_argument("--tail", type=int, default=100, metavar="N",
+                   help="Lines of recent logs to show (default: 100)")
+    p.set_defaults(func=cmd_logs)
+
+    # ── delete ──
+    p = sub.add_parser("delete", help="Delete one or more jobs or pods")
+    p.add_argument("names", nargs="+", metavar="NAME", help="Job or pod name(s)")
+    p.set_defaults(func=cmd_delete)
+
+    # ── describe ──
+    p = sub.add_parser("describe", help="Describe a job or pod")
+    p.add_argument("name", metavar="NAME", help="Job or pod name")
+    p.set_defaults(func=cmd_describe)
+
+    # ── exec ──
+    p = sub.add_parser("exec", help="Exec into a running pod or job")
+    p.add_argument("pod", metavar="JOB_OR_POD", help="Job name (finds its active pod) or pod name")
+    p.add_argument("command", nargs=argparse.REMAINDER, metavar="-- COMMAND",
+                   help="Command to run (default: bash)")
+    p.set_defaults(func=cmd_exec)
+
+    # ── bash ──
+    p = sub.add_parser("bash", help="Open an interactive bash shell in a running job (like runai bash)")
+    p.add_argument("pod", metavar="JOB_OR_POD", help="Job name (finds its active pod) or pod name")
+    p.set_defaults(func=cmd_bash)
+
+    # ── gpus ──
+    p = sub.add_parser("gpus", help="Show GPU availability across nodes")
+    p.set_defaults(func=cmd_gpus)
+
+    # ── status ──
+    p = sub.add_parser("status", help="Show all resources in the namespace")
+    p.set_defaults(func=cmd_status)
+
+    # ── add-user ──
+    p = sub.add_parser("add-user", help="Add a user to this lab (lab-manager or admin)")
+    p.add_argument("--name", required=True, metavar="USERNAME",
+                   help="New user's username (must match their OS account)")
+    p.add_argument("--role", choices=["researcher", "lab-manager"], default="researcher",
+                   help="Role to assign (default: researcher)")
+    p.add_argument("--queue", metavar="QUEUE",
+                   help="Default queue for this user (default from config)")
+    p.set_defaults(func=cmd_add_user)
+
+    # ── setup ──
+    p = sub.add_parser("setup", help="Install kubeconfig and CLI config from files")
+    p.add_argument("config_file", metavar="CONFIG",
+                   help="Path to kai-config-<user>.yaml (received from lab manager)")
+    p.add_argument("kubeconfig_file", metavar="KUBECONFIG",
+                   help="Path to kai-kubeconfig-<user>.yaml (received via secure channel)")
+    p.set_defaults(func=cmd_setup)
+
+    # ── update ──
+    p = sub.add_parser("update", help="Fetch latest config from GitHub")
+    p.add_argument("--quiet", action="store_true",
+                   help="Write to pending file; user is prompted on next login")
+    p.set_defaults(func=cmd_update)
+
+    # ── check-update ──
+    p = sub.add_parser("check-update", help="Prompt to apply any pending config update (called on login)")
+    p.set_defaults(func=cmd_check_update)
+
+    # ── install ──
+    p = sub.add_parser("install", help="Add login hooks to ~/.bashrc or ~/.zshrc")
+    p.set_defaults(func=cmd_install)
+
+    # ── self-update ──
+    p = sub.add_parser("self-update", help="Upgrade kai itself from GitHub")
+    p.set_defaults(func=cmd_self_update)
+
+    # ── queue ──
+    p = sub.add_parser("queue", help="Manage KAI scheduler queues (lab-manager only)")
+    qsub = p.add_subparsers(dest="queue_cmd", metavar="SUBCOMMAND")
+    qsub.required = True
+
+    qp = qsub.add_parser("list", help="List all queues")
+    qp = qsub.add_parser("create", help="Create a new child queue")
+    qp.add_argument("--name", required=True, metavar="NAME", help="Queue name")
+    qp.add_argument("--quota", type=int, default=0, metavar="N",
+                    help="GPU quota floor (default: 0 = no guarantee)")
+    qp.add_argument("--priority", type=int, default=100, metavar="N",
+                    help="Priority (default: 100; 0 = preemptible)")
+    qp.add_argument("--parent", metavar="QUEUE",
+                    help="Parent queue name (default: from config file)")
+    qp = qsub.add_parser("delete", help="Delete a queue")
+    qp.add_argument("name", metavar="NAME", help="Queue name")
+    p.set_defaults(func=cmd_queue)
+
+    args = parser.parse_args()
+
+    # Re-load config with explicit --config path if given, then apply CLI overrides
+    if args.config:
+        _load_config(explicit_path=args.config)
+    if args.kubeconfig:
+        KUBECONFIG = args.kubeconfig
+    if args.namespace:
+        NAMESPACE = args.namespace
+
+    # Apply DEFAULT_QUEUE for submit if --queue was not specified
+    if getattr(args, "queue", None) is None and hasattr(args, "queue"):
+        args.queue = DEFAULT_QUEUE
+
+    # Strip leading '--' from remainder args (submit and exec)
+    for field in ("command",):
+        val = getattr(args, field, None)
+        if isinstance(val, list) and val and val[0] == "--":
+            setattr(args, field, val[1:])
+
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
