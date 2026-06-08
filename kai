@@ -781,18 +781,8 @@ def cmd_setup(args):
     except Exception:
         pass
 
-    # Store GitHub token — required for lab managers to push user configs via kai add-user
+    # Store GitHub token if provided via --github-token flag
     token = getattr(args, "github_token", None)
-    if not token and cfg.get("config_base_url") and cfg.get("role") == "lab-manager":
-        print()
-        print("This config has role: lab-manager and a config_base_url.")
-        print("A GitHub personal access token is required to push user configs (kai add-user).")
-        sys.stdout.write("GitHub token (ghp_..., blank to skip): ")
-        sys.stdout.flush()
-        try:
-            token = sys.stdin.readline().strip() or None
-        except (KeyboardInterrupt, EOFError):
-            token = None
     if token:
         cred_path = os.path.join(_KAI_HOME, "credentials")
         try:
