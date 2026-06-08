@@ -314,9 +314,13 @@ def _build_manifest(*, name, image, command, gpu_count, cpu_req, mem_req,
     if interactive:
         container["command"] = ["sleep", "infinity"]
     elif command:
-        container["command"] = command[:1]
-        if len(command) > 1:
-            container["args"] = command[1:]
+        if command[0].startswith("-"):
+            # Flags-only command: pass as args to the image's existing entrypoint
+            container["args"] = command
+        else:
+            container["command"] = command[:1]
+            if len(command) > 1:
+                container["args"] = command[1:]
 
     if envs:
         container["env"] = [{"name": k, "value": v} for k, v in envs.items()]
