@@ -184,6 +184,9 @@ def _git_push_config(owner, repo, branch, path, content, message):
     clone_url = f"git@github.com:{owner}/{repo}.git"
 
     if os.path.isdir(os.path.join(clone_dir, ".git")):
+        # Ensure the remote uses SSH (migrate old HTTPS clones)
+        subprocess.run(["git", "-C", clone_dir, "remote", "set-url", "origin", clone_url],
+                       check=True, capture_output=True)
         print(f"Pulling latest from github.com/{owner}/{repo}...", end=" ", flush=True)
         result = subprocess.run(["git", "-C", clone_dir, "pull", "--quiet"],
                                 capture_output=True, text=True)
