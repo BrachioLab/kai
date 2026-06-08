@@ -607,7 +607,7 @@ def cmd_gpus(args):
 
 def cmd_status(args):
     """Show all resources in the namespace."""
-    kubectl("get", "all", "-n", NAMESPACE, capture=False)
+    kubectl("get", "pods,jobs", "-n", NAMESPACE, capture=False)
 
 
 def cmd_add_user(args):
