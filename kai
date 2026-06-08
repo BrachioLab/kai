@@ -707,6 +707,11 @@ def _build_and_push_config(username, role, queue, lab_name, commit_msg=None):
         print("done")
     else:
         _git_push_config(owner, repo, branch, config_gh_path, config_content, msg)
+    # Keep local config in sync so `kai update` doesn't immediately flag a diff
+    local_config_path = os.path.join(_KAI_HOME, "config.yaml")
+    with open(local_config_path, "w") as f:
+        f.write(config_content)
+
     print(f"✓  {username}  [{role}]  namespace:{NAMESPACE}  queue:{queue}")
     print(f"   cli config → github.com/{owner}/{repo}/{config_gh_path}")
 
