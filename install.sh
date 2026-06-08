@@ -38,34 +38,18 @@ fi
 
 export PATH="${KAI_BIN}:${PATH}"
 
-# Prompt for GitHub token — required for lab managers (kai add-user pushes configs to GitHub).
-# Researchers can leave this blank.
+# Prompt for the configs repository — stores where user CLI configs live.
+# Once set, kai setup only needs a kubeconfig; the config is fetched automatically.
 echo ""
-printf "GitHub personal access token (lab managers only — press Enter to skip): "
-# Read with no echo if stty is available
-if command -v stty >/dev/null 2>&1; then
-    stty -echo 2>/dev/null
-    read -r KAI_GITHUB_TOKEN
-    stty echo 2>/dev/null
-    echo ""
-else
-    read -r KAI_GITHUB_TOKEN
-fi
+printf "Configs repository (e.g. brachiolab/brachiolab-configs, press Enter to skip): "
+read -r CONFIGS_REPO_SLUG
 
-if [ -n "${KAI_GITHUB_TOKEN}" ]; then
-    mkdir -p "${KAI_HOME}"
-    CRED_FILE="${KAI_HOME}/credentials"
-    # Preserve any existing credentials and upsert github_token
-    if [ -f "${CRED_FILE}" ]; then
-        # Remove existing github_token line if present, then append
-        grep -v '^github_token:' "${CRED_FILE}" > "${CRED_FILE}.tmp" 2>/dev/null || true
-        mv "${CRED_FILE}.tmp" "${CRED_FILE}"
-    fi
-    printf 'github_token: %s\n' "${KAI_GITHUB_TOKEN}" >> "${CRED_FILE}"
-    chmod 600 "${CRED_FILE}"
-    echo "✓ GitHub token saved to ${CRED_FILE}"
+if [ -n "${CONFIGS_REPO_SLUG}" ]; then
+    CONFIGS_REPO_URL="https://raw.githubusercontent.com/${CONFIGS_REPO_SLUG}/main"
+    printf '%s\n' "${CONFIGS_REPO_URL}" > "${KAI_HOME}/configs_repo"
+    echo "✓ Configs repo → ${KAI_HOME}/configs_repo"
 else
-    echo "  (skipped — run 'kai setup <config> <kubeconfig> --github-token <TOKEN>' later if needed)"
+    echo "  (skipped — run 'kai setup <config.yaml> <kubeconfig.yaml>' to set up manually)"
 fi
 
 echo ""
@@ -73,7 +57,7 @@ echo "✓ kai installed to ${KAI_BIN}/kai"
 echo ""
 echo "Next steps:"
 echo "  1. Start a new shell (or run: source ${RC})"
-echo "  2. Get your config and kubeconfig files from your lab manager, then run:"
-echo "       kai setup <config.yaml> <kubeconfig.yaml>"
+echo "  2. Get your kubeconfig from your lab manager, then run:"
+echo "       kai setup <kubeconfig.yaml>"
 echo "  3. Enable automatic config updates on login:"
 echo "       kai install"

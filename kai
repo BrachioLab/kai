@@ -3,7 +3,7 @@
 kai — generic CLI for the KAI Scheduler.
 
 Usage:
-  kai setup CONFIG KUBECONFIG [--github-token TOKEN]  Install config and kubeconfig files (first-time setup)
+  kai setup [CONFIG] KUBECONFIG    Install config and kubeconfig (CONFIG auto-fetched if configs repo is set)
   kai install                      Add update check hook to shell rc
   kai update [--quiet] [--force]   Check for config update; prompts before applying
   kai self-update                  Upgrade kai itself from GitHub
@@ -115,6 +115,16 @@ def _read_github_token():
         with open(cred_path) as f:
             creds = yaml.safe_load(f) or {}
         return creds.get("github_token")
+    except FileNotFoundError:
+        return None
+
+
+def _read_configs_repo():
+    """Read the configs repo base URL from ~/.kai/configs_repo (set during install)."""
+    path = os.path.join(_KAI_HOME, "configs_repo")
+    try:
+        with open(path) as f:
+            return f.read().strip() or None
     except FileNotFoundError:
         return None
 
@@ -686,29 +696,35 @@ def cmd_add_user(args):
     }
     if args.role == "lab-manager":
         cli_cfg["parent_queue"] = lab_name
-    if CONFIG_BASE_URL:
-        cli_cfg["config_url"]      = f"{CONFIG_BASE_URL}/{args.name}.yaml"
-        cli_cfg["config_base_url"] = CONFIG_BASE_URL
     if QUEUE_NODES:
         cli_cfg["queue_nodes"] = dict(QUEUE_NODES)
 
-    # Push CLI config to GitHub (mandatory)
-    if not CONFIG_BASE_URL:
+    # Resolve config_base_url: prefer config file value, fall back to configs_repo + namespace
+    config_base_url = CONFIG_BASE_URL
+    if not config_base_url:
+        configs_repo = _read_configs_repo()
+        if configs_repo and NAMESPACE:
+            config_base_url = f"{configs_repo}/{NAMESPACE}"
+    if not config_base_url:
         _die(
             "config_base_url is not set — cannot push user config to GitHub.\n"
-            "  This is set automatically when you ran 'kai setup' with a config that\n"
-            "  includes config_base_url. Check ~/.kai/config.yaml."
+            "  Re-run install.sh and enter the configs repository, or set\n"
+            "  config_base_url in ~/.kai/config.yaml."
         )
+
+    # Now we know config_base_url — write it into the generated config
+    cli_cfg["config_url"]      = f"{config_base_url}/{args.name}.yaml"
+    cli_cfg["config_base_url"] = config_base_url
+
     token = os.environ.get("KAI_GITHUB_TOKEN") or _read_github_token()
     if not token:
         _die(
             "GitHub token required to push user configs.\n"
-            "  Store it in ~/.kai/credentials (github_token: ghp_...) or re-run:\n"
-            "    kai setup <config> <kubeconfig> --github-token <TOKEN>\n"
-            "  Or set KAI_GITHUB_TOKEN in your environment."
+            "  Store it in ~/.kai/credentials (github_token: ghp_...) or\n"
+            "  set KAI_GITHUB_TOKEN in your environment."
         )
 
-    owner, repo, branch, path_prefix = _parse_raw_github_url(CONFIG_BASE_URL)
+    owner, repo, branch, path_prefix = _parse_raw_github_url(config_base_url)
     config_filename = f"{args.name}.yaml"
     config_gh_path = f"{path_prefix}/{config_filename}" if path_prefix else config_filename
     config_content = yaml.dump(cli_cfg, default_flow_style=False, sort_keys=False)
@@ -765,21 +781,63 @@ def cmd_setup(args):
     print(f"✓ kubeconfig → {kubeconfig_dest}")
 
     config_dest = os.path.join(_KAI_HOME, "config.yaml")
-    shutil.copy2(args.config_file, config_dest)
-    print(f"✓ config     → {config_dest}")
 
-    # Persist config_url in a separate file so kai update survives config rewrites
-    try:
-        with open(args.config_file) as f:
-            cfg = yaml.safe_load(f) or {}
-        url = cfg.get("config_url")
-        if url:
-            url_file = os.path.join(_KAI_HOME, "config_url")
-            with open(url_file, "w") as f:
-                f.write(url.strip() + "\n")
-            print(f"✓ config_url → {url_file}")
-    except Exception:
-        pass
+    if args.config_file:
+        shutil.copy2(args.config_file, config_dest)
+        print(f"✓ config     → {config_dest}")
+        try:
+            with open(args.config_file) as f:
+                cfg = yaml.safe_load(f) or {}
+        except Exception:
+            cfg = {}
+    else:
+        # Auto-fetch config from configs_repo using namespace from kubeconfig and $USER
+        configs_repo = _read_configs_repo()
+        if not configs_repo:
+            _die(
+                "No config file provided and no configs repo set.\n"
+                "  Either provide a config file:\n"
+                "    kai setup <config.yaml> <kubeconfig.yaml>\n"
+                "  Or re-run install.sh and enter the configs repository."
+            )
+        try:
+            with open(args.kubeconfig_file) as f:
+                kc = yaml.safe_load(f)
+            namespace = kc["contexts"][0]["context"]["namespace"]
+        except Exception as e:
+            _die(f"Could not read namespace from kubeconfig: {e}")
+        username = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+        if not username:
+            _die("Could not determine username from $USER — provide a config file explicitly.")
+        config_url = f"{configs_repo}/{namespace}/{username}.yaml"
+        print(f"Fetching config for '{username}' from {configs_repo}/{namespace}/ ...", end=" ", flush=True)
+        try:
+            req = urllib.request.Request(config_url)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                config_content = resp.read().decode()
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                print()
+                _die(
+                    f"No config found for '{username}' in namespace '{namespace}'.\n"
+                    f"  Ask your lab manager to run: kai add-user --name {username}"
+                )
+            _die(f"Failed to fetch config: HTTP {e.code}")
+        except Exception as e:
+            _die(f"Failed to fetch config: {e}")
+        print("done")
+        with open(config_dest, "w") as f:
+            f.write(config_content)
+        print(f"✓ config     → {config_dest}")
+        cfg = yaml.safe_load(config_content) or {}
+
+    # Persist config_url so kai update survives config rewrites
+    url = cfg.get("config_url")
+    if url:
+        url_file = os.path.join(_KAI_HOME, "config_url")
+        with open(url_file, "w") as f:
+            f.write(url.strip() + "\n")
+        print(f"✓ config_url → {url_file}")
 
     # Store GitHub token if provided via --github-token flag
     token = getattr(args, "github_token", None)
@@ -1260,12 +1318,12 @@ def main():
 
     # ── setup ──
     p = sub.add_parser("setup", help="Install kubeconfig and CLI config from files")
-    p.add_argument("config_file", metavar="CONFIG",
-                   help="Path to kai-config-<user>.yaml (received from lab manager)")
+    p.add_argument("config_file", metavar="CONFIG", nargs="?", default=None,
+                   help="Path to kai-config-<user>.yaml (omit to auto-fetch from the configured configs repo)")
     p.add_argument("kubeconfig_file", metavar="KUBECONFIG",
                    help="Path to kai-kubeconfig-<user>.yaml (received via secure channel)")
     p.add_argument("--github-token", metavar="TOKEN",
-                   help="GitHub personal access token (stored in ~/.kai/credentials; required for lab managers to push user configs)")
+                   help="GitHub personal access token (stored in ~/.kai/credentials; required for lab managers)")
     p.set_defaults(func=cmd_setup)
 
     # ── update ──
