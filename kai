@@ -1173,7 +1173,7 @@ def _queue_create(args):
         msg += f"  node:{node_str}"
         print(msg)
         print(f"  → node selector saved to ~/.kai/config.yaml")
-        print(f"  → Re-run 'kai add-user' for existing users and push to distribute")
+        print(f"  → Re-run 'kai push-config' for existing users to distribute")
     else:
         print(msg)
 
