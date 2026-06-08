@@ -712,41 +712,45 @@ def cmd_add_user(args):
     cli_cfg["config_url"]      = f"{config_base_url}/{args.name}.yaml"
     cli_cfg["config_base_url"] = config_base_url
 
-    token = os.environ.get("KAI_GITHUB_TOKEN") or _read_github_token()
-    if not token:
-        _die(
-            "GitHub token required to push user configs.\n"
-            "  Store it in ~/.kai/credentials (github_token: ghp_...) or\n"
-            "  set KAI_GITHUB_TOKEN in your environment."
-        )
-
     owner, repo, branch, path_prefix = _parse_raw_github_url(config_base_url)
     config_filename = f"{args.name}.yaml"
     config_gh_path = f"{path_prefix}/{config_filename}" if path_prefix else config_filename
     config_content = yaml.dump(cli_cfg, default_flow_style=False, sort_keys=False)
 
-    print(f"Pushing config to github.com/{owner}/{repo}...", end=" ", flush=True)
-    _github_push_file(
-        owner, repo, branch, config_gh_path,
-        config_content,
-        f"add {args.name} to {NAMESPACE}",
-        token,
-    )
-    print("done")
-
-    # Also write locally so the lab manager can hand it to the user for kai setup
+    # Write config locally (always)
     config_file = f"kai-config-{args.name}.yaml"
     with open(config_file, "w") as f:
         f.write(config_content)
 
+    # Push to GitHub if a token is available; otherwise print commit instructions
+    token = os.environ.get("KAI_GITHUB_TOKEN") or _read_github_token()
+    if token:
+        print(f"Pushing config to github.com/{owner}/{repo}...", end=" ", flush=True)
+        _github_push_file(
+            owner, repo, branch, config_gh_path,
+            config_content,
+            f"add {args.name} to {NAMESPACE}",
+            token,
+        )
+        print("done")
+        github_note = f"(pushed to github.com/{owner}/{repo})"
+    else:
+        github_note = f"← commit to github.com/{owner}/{repo} as {config_gh_path}"
+
     print(f"\n✓  {args.name}  [{args.role}]  namespace:{NAMESPACE}  queue:{queue}")
     print(f"\n   kubeconfig : {kubeconfig_file}  ← keep secret, share via secure channel")
-    print(f"   cli config : {config_file}  ← safe to share (also pushed to GitHub)")
+    print(f"   cli config : {config_file}  {github_note}")
+    if not token:
+        print()
+        print("   Commit the config so the user can auto-update:")
+        print(f"     git add {config_file}")
+        print(f"     git commit -m 'add {args.name} to {NAMESPACE}'")
+        print(f"     git push")
     print()
     print("   Share with the user:")
     print(f"     1. Send {kubeconfig_file} securely (Slack DM, encrypted email, etc.)")
     print(f"     2. User runs on their machine:")
-    print(f"          kai setup {config_file} {kubeconfig_file}")
+    print(f"          kai setup {kubeconfig_file}")
     print(f"          kai install")
 
     if args.role == "lab-manager":
