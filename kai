@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # User home directory for all kai files — mirrors ~/.oh-my-zsh layout
-_VERSION  = "0.2.6"
+_VERSION  = "0.2.7"
 _KAI_HOME = os.path.expanduser("~/.kai")
 
 # Namespace for all workloads.
@@ -761,6 +761,69 @@ def cmd_gpus(args):
         footer=("TOTAL", "", str(total_count), str(total_used), str(total_count - total_used)),
     )
 
+# ── nodes ──────────────────────────────────────────────────────────────────────
+
+def cmd_nodes(args):
+    r = kubectl("get", "nodes", "-o", "json", capture=True)
+    nodes = json.loads(r.stdout).get("items", [])
+
+    # GPU allocation across all namespaces
+    rp = kubectl("get", "pods", "--all-namespaces", "-o", "json", capture=True)
+    pods = json.loads(rp.stdout).get("items", [])
+    allocated = {}
+    for pod in pods:
+        if pod.get("status", {}).get("phase") not in ("Running", "Pending"):
+            continue
+        node = pod.get("spec", {}).get("nodeName") or ""
+        for c in pod.get("spec", {}).get("containers", []):
+            gpus = int(c.get("resources", {}).get("limits", {}).get("nvidia.com/gpu", 0))
+            if gpus:
+                allocated[node] = allocated.get(node, 0) + gpus
+
+    now = datetime.now(timezone.utc)
+    rows = []
+    for node in nodes:
+        name   = node["metadata"]["name"]
+        spec   = node.get("spec", {})
+        conds  = {c["type"]: c for c in node["status"].get("conditions", [])}
+
+        # Ready status + last heartbeat age
+        ready_cond = conds.get("Ready", {})
+        ready      = ready_cond.get("status", "Unknown")
+        heartbeat  = ready_cond.get("lastHeartbeatTime", "")
+        if heartbeat:
+            hb_age = _fmt_age(heartbeat)
+        else:
+            hb_age = "?"
+
+        # Node status string
+        if spec.get("unschedulable"):
+            status = "Cordoned"
+        elif ready != "True":
+            status = "NotReady"
+        else:
+            status = "Ready"
+
+        # Active pressure conditions
+        issues = []
+        for cond_type in ("DiskPressure", "MemoryPressure", "PIDPressure"):
+            if conds.get(cond_type, {}).get("status") == "True":
+                issues.append(cond_type)
+        issues_str = ", ".join(issues) if issues else "—"
+
+        # GPU info (GPU nodes only)
+        gpu_info = GPU_NODES.get(name)
+        if gpu_info:
+            total = gpu_info["count"]
+            used  = allocated.get(name, 0)
+            gpu_col = f"{used}/{total}"
+        else:
+            gpu_col = "—"
+
+        rows.append((name, status, gpu_col, hb_age, issues_str))
+
+    _print_table(("NODE", "STATUS", "GPU (used/total)", "HEARTBEAT", "CONDITIONS"), rows)
+
 # ── user config helpers ────────────────────────────────────────────────────────
 
 def _build_and_push_config(username, role, queue, lab_name, commit_msg=None):
@@ -1463,6 +1526,10 @@ def main():
     # ── gpus ──
     p = sub.add_parser("gpus", help="Show GPU availability across nodes")
     p.set_defaults(func=cmd_gpus)
+
+    # ── nodes ──
+    p = sub.add_parser("nodes", help="Show node health, GPU usage, and active conditions")
+    p.set_defaults(func=cmd_nodes)
 
     # ── status ──
     p = sub.add_parser("status", help="Show all resources in the namespace")
