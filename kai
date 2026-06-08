@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # User home directory for all kai files — mirrors ~/.oh-my-zsh layout
-_VERSION  = "0.2.3"
+_VERSION  = "0.2.4"
 _KAI_HOME = os.path.expanduser("~/.kai")
 
 # Namespace for all workloads.
@@ -300,7 +300,8 @@ def _build_resources(gpu_count, cpu_req, mem_req):
 
 def _build_manifest(*, name, image, command, gpu_count, cpu_req, mem_req,
                     queue, node_selector, node_affinity, backoff_limit, envs,
-                    interactive, volumes, ports, workdir, large_shm, attach):
+                    interactive, volumes, ports, workdir, large_shm, attach,
+                    host_network=False):
     pod_labels = {
         "kai.scheduler/queue": queue,
         "priorityClassName":   QUEUE_PRIORITY_CLASS.get(queue, "build"),
@@ -367,6 +368,9 @@ def _build_manifest(*, name, image, command, gpu_count, cpu_req, mem_req,
         "restartPolicy": "Never",
         "containers":    [container],
     }
+    if host_network:
+        pod_spec["hostNetwork"] = True
+        pod_spec["dnsPolicy"] = "ClusterFirstWithHostNet"
     if node_selector:
         pod_spec["nodeSelector"] = node_selector
     if node_affinity:
@@ -444,6 +448,8 @@ def cmd_submit(args):
         args.port = [str(p) for p in (_job.get("ports") or [])] + list(args.port or [])
         if not args.forward:
             args.forward = bool(_job.get("forward", False))
+        if not args.host_network:
+            args.host_network = bool(_job.get("host_network", False))
         # Command: file wins if CLI has none
         if not args.command:
             _cmd = _job.get("command")
@@ -511,6 +517,7 @@ def cmd_submit(args):
         workdir=args.workdir,
         large_shm=args.large_shm,
         attach=args.attach,
+        host_network=args.host_network,
     )
 
     kubectl("apply", "-f", "-", capture=True, stdin_data=json.dumps(manifest))
@@ -1391,6 +1398,8 @@ def main():
                    help="Declare a container port (repeatable; use with --forward to auto-forward)")
     p.add_argument("--forward", action="store_true",
                    help="After pod starts, port-forward all declared --port mappings (blocks until Ctrl-C)")
+    p.add_argument("--host-network", action="store_true",
+                   help="Use the node's network namespace (exposes ports directly on the host)")
     p.add_argument("--workdir", "-w", metavar="PATH",
                    help="Set the working directory inside the container")
     p.add_argument("command", nargs=argparse.REMAINDER, metavar="-- COMMAND [ARGS]",
