@@ -740,6 +740,11 @@ def _build_and_push_config(username, role, queue, lab_name, commit_msg=None):
             "  Re-run install.sh and enter the configs repository, or set\n"
             "  config_base_url in ~/.kai/config.yaml."
         )
+    # If targeting a different namespace, substitute it into the base URL so
+    # the config lands in the right directory in the configs repo.
+    if NAMESPACE:
+        base, _, _ = config_base_url.rstrip("/").rpartition("/")
+        config_base_url = f"{base}/{NAMESPACE}"
 
     cli_cfg = {
         "namespace":     NAMESPACE,
