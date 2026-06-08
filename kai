@@ -399,6 +399,56 @@ def _build_manifest(*, name, image, command, gpu_count, cpu_req, mem_req,
 # ── submit ─────────────────────────────────────────────────────────────────────
 
 def cmd_submit(args):
+    # Load job file and merge; CLI args take precedence over file values
+    if args.file:
+        with open(args.file) as _f:
+            _job = yaml.safe_load(_f) or {}
+        if not args.image:
+            args.image = _job.get("image") or _die("job file missing 'image'")
+        if not args.name:
+            args.name = _job.get("name")
+        if args.gpu == 0 and _job.get("gpu"):
+            args.gpu = int(_job["gpu"])
+        if not args.cpu:
+            args.cpu = _job.get("cpu")
+        if not args.memory:
+            args.memory = _job.get("memory")
+        if not args.queue:
+            args.queue = _job.get("queue")
+        if not args.node:
+            args.node = _job.get("node")
+        if not args.gpu_type:
+            args.gpu_type = _job.get("gpu_type")
+        if not args.workdir:
+            args.workdir = _job.get("workdir")
+        if not args.large_shm:
+            args.large_shm = bool(_job.get("large_shm", False))
+        if not args.interactive:
+            args.interactive = bool(_job.get("interactive", False))
+        if not args.attach:
+            args.attach = bool(_job.get("attach", False))
+        if args.backoff_limit is None and "backoff_limit" in _job:
+            args.backoff_limit = int(_job["backoff_limit"])
+        # Env: file provides a dict; CLI --env list is appended on top
+        _file_env = _job.get("env") or {}
+        _cli_env = list(args.env or [])
+        _cli_keys = {e.split("=", 1)[0] for e in _cli_env if "=" in e}
+        args.env = [f"{k}={v}" for k, v in _file_env.items() if k not in _cli_keys] + _cli_env
+        # Volumes, ports: file provides lists; CLI appends on top
+        args.volume = list(_job.get("volumes") or []) + list(args.volume or [])
+        args.port = [str(p) for p in (_job.get("ports") or [])] + list(args.port or [])
+        # Command: file wins if CLI has none
+        if not args.command:
+            _cmd = _job.get("command")
+            if isinstance(_cmd, str):
+                import shlex
+                args.command = shlex.split(_cmd)
+            elif isinstance(_cmd, list):
+                args.command = [str(c) for c in _cmd]
+
+    if not args.image:
+        _die("--image is required (or set 'image' in the job file)")
+
     name = args.name or _unique_name()
 
     # Enforce allowed_queues from config file
@@ -1234,6 +1284,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
         examples:
+          kai submit -f vllm.yaml
           kai submit --image pytorch:24.01 --gpu 1 -- python train.py
           kai submit --image pytorch:24.01 --gpu 2 --node carnaroli -- torchrun --nproc=2 train.py
           kai submit --image pytorch:24.01 --gpu 1 --queue preemptible -- python explore.py
@@ -1264,7 +1315,9 @@ def main():
     # ── submit ──
     p = sub.add_parser("submit", help="Submit a job",
                        formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--image", "-i", required=True, metavar="IMAGE",
+    p.add_argument("--file", "-f", metavar="FILE",
+                   help="Job definition file (YAML or JSON); CLI flags override file values")
+    p.add_argument("--image", "-i", metavar="IMAGE",
                    help="Container image")
     p.add_argument("--name", "-n", metavar="NAME",
                    help="Job name (auto-generated if omitted)")
