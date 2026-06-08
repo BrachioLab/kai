@@ -1042,7 +1042,8 @@ def cmd_update(args):
     kai_bin = os.path.join(_KAI_HOME, "bin", "kai")
     if os.path.exists(kai_bin):
         try:
-            req = urllib.request.Request(_KAI_SCRIPT_URL)
+            url = f"{_KAI_SCRIPT_URL}?{int(time.time())}" if force else _KAI_SCRIPT_URL
+            req = urllib.request.Request(url)
             with urllib.request.urlopen(req, timeout=10) as resp:
                 new_script = resp.read()
             with open(kai_bin, "rb") as f:
