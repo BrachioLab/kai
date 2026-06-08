@@ -178,6 +178,46 @@ def _github_push_file(owner, repo, branch, path, content, message, token):
         _die(f"GitHub API error {e.code} pushing {path}: {e.read().decode()}")
 
 
+def _git_push_config(owner, repo, branch, path, content, message):
+    """Commit and push a config file via git, using a local clone in ~/.kai/configs/."""
+    clone_dir = os.path.join(_KAI_HOME, "configs")
+    clone_url = f"https://github.com/{owner}/{repo}.git"
+
+    if os.path.isdir(os.path.join(clone_dir, ".git")):
+        print(f"Pulling latest from github.com/{owner}/{repo}...", end=" ", flush=True)
+        result = subprocess.run(["git", "-C", clone_dir, "pull", "--quiet"],
+                                capture_output=True, text=True)
+        if result.returncode != 0:
+            _die(f"git pull failed:\n{result.stderr.strip()}")
+    else:
+        print(f"Cloning github.com/{owner}/{repo}...", end=" ", flush=True)
+        result = subprocess.run(["git", "clone", "--quiet", clone_url, clone_dir],
+                                capture_output=True, text=True)
+        if result.returncode != 0:
+            _die(f"git clone failed:\n{result.stderr.strip()}")
+    print("done")
+
+    file_path = os.path.join(clone_dir, path)
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    with open(file_path, "w") as f:
+        f.write(content)
+
+    subprocess.run(["git", "-C", clone_dir, "add", path], check=True)
+    result = subprocess.run(
+        ["git", "-C", clone_dir, "commit", "-m", message],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0 and "nothing to commit" not in result.stdout:
+        _die(f"git commit failed:\n{result.stderr.strip()}")
+
+    print(f"Pushing to github.com/{owner}/{repo}...", end=" ", flush=True)
+    result = subprocess.run(["git", "-C", clone_dir, "push", "--quiet"],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        _die(f"git push failed:\n{result.stderr.strip()}")
+    print("done")
+
+
 # Queue → KAI built-in priorityClassName
 QUEUE_PRIORITY_CLASS = {
     "preemptible": "train",   # value 50, reclaimable — default queue
@@ -657,26 +697,15 @@ def _build_and_push_config(username, role, queue, lab_name, commit_msg=None):
         f.write(config_content)
 
     token = os.environ.get("KAI_GITHUB_TOKEN") or _read_github_token()
+    msg = commit_msg or f"update {username} in {NAMESPACE}"
     if token:
         print(f"Pushing config to github.com/{owner}/{repo}...", end=" ", flush=True)
-        _github_push_file(
-            owner, repo, branch, config_gh_path,
-            config_content,
-            commit_msg or f"update {username} in {NAMESPACE}",
-            token,
-        )
+        _github_push_file(owner, repo, branch, config_gh_path, config_content, msg, token)
         print("done")
-        print(f"✓  {username}  [{role}]  namespace:{NAMESPACE}  queue:{queue}")
-        print(f"   cli config pushed to github.com/{owner}/{repo} ({config_gh_path})")
     else:
-        print(f"✓  {username}  [{role}]  namespace:{NAMESPACE}  queue:{queue}")
-        print(f"   cli config : {config_file}  ← commit to github.com/{owner}/{repo} as {config_gh_path}")
-        print()
-        print("   Commit the config so the user can auto-update:")
-        print(f"     git add {config_file}")
-        git_msg = commit_msg or f"update {username}"
-        print(f"     git commit -m '{git_msg}'")
-        print(f"     git push")
+        _git_push_config(owner, repo, branch, config_gh_path, config_content, msg)
+    print(f"✓  {username}  [{role}]  namespace:{NAMESPACE}  queue:{queue}")
+    print(f"   cli config → github.com/{owner}/{repo}/{config_gh_path}")
 
 
 def cmd_push_config(args):
