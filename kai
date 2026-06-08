@@ -802,15 +802,19 @@ def cmd_update(args):
     print("[kai] Config updated.")
 
 
-def cmd_install(args):
-    """Add a login hook to ~/.bashrc or ~/.zshrc that checks for config updates."""
-    marker = "kai update --quiet"
-    hook = (
-        "# kai: check for updates on login\n"
-        "kai self-update --quiet 2>/dev/null\n"
-        "kai update --quiet 2>/dev/null\n"
-    )
+_INSTALL_HOOK = (
+    "# kai: check for updates on login\n"
+    "kai self-update --quiet 2>/dev/null\n"
+    "kai update --quiet 2>/dev/null\n"
+)
+# Sentinel that appears only in the current hook — used to detect stale versions
+_INSTALL_HOOK_SENTINEL = "kai self-update --quiet"
+# Sentinel that appears in any kai hook (old or new) — used to find the block to replace
+_INSTALL_HOOK_ANY = "# kai: check for"
 
+
+def cmd_install(args):
+    """Add (or update) the login hook in ~/.bashrc or ~/.zshrc."""
     shell = os.path.basename(os.environ.get("SHELL", "bash"))
     rc_path = os.path.expanduser("~/.zshrc" if shell == "zsh" else "~/.bashrc")
 
@@ -820,13 +824,25 @@ def cmd_install(args):
     except FileNotFoundError:
         content = ""
 
-    if marker in content:
-        print(f"Auto-update already configured in {rc_path}")
+    if _INSTALL_HOOK_SENTINEL in content:
+        print(f"Login hook is already up to date in {rc_path}")
         return
 
-    with open(rc_path, "a") as f:
-        f.write(f"\n{hook}")
-    print(f"✓ Auto-update hook added to {rc_path}")
+    if _INSTALL_HOOK_ANY in content:
+        # Replace stale hook block (comment + following kai lines) with current hook
+        import re
+        new_content = re.sub(
+            r"# kai: check for[^\n]*\n(?:kai [^\n]+\n)*",
+            _INSTALL_HOOK,
+            content,
+        )
+        with open(rc_path, "w") as f:
+            f.write(new_content)
+        print(f"✓ Login hook updated in {rc_path}")
+    else:
+        with open(rc_path, "a") as f:
+            f.write(f"\n{_INSTALL_HOOK}")
+        print(f"✓ Login hook added to {rc_path}")
     print(f"  Takes effect in new shell sessions (or: source {rc_path})")
 
 
