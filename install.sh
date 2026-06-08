@@ -38,19 +38,20 @@ fi
 
 export PATH="${KAI_BIN}:${PATH}"
 
-# Prompt for the configs repository — stores where user CLI configs live.
+# Prompt for the configs repository — required to continue installation.
 # Once set, kai setup only needs a kubeconfig; the config is fetched automatically.
 echo ""
-printf "Configs repository (e.g. brachiolab/brachiolab-configs, press Enter to skip): "
+printf "Configs repository (e.g. brachiolab/brachiolab-configs): "
 read -r CONFIGS_REPO_SLUG
 
-if [ -n "${CONFIGS_REPO_SLUG}" ]; then
-    CONFIGS_REPO_URL="https://raw.githubusercontent.com/${CONFIGS_REPO_SLUG}/main"
-    printf '%s\n' "${CONFIGS_REPO_URL}" > "${KAI_HOME}/configs_repo"
-    echo "✓ Configs repo → ${KAI_HOME}/configs_repo"
-else
-    echo "  (skipped — run 'kai setup <config.yaml> <kubeconfig.yaml>' to set up manually)"
+if [ -z "${CONFIGS_REPO_SLUG}" ]; then
+    echo "error: configs repository is required" >&2
+    exit 1
 fi
+
+CONFIGS_REPO_URL="https://raw.githubusercontent.com/${CONFIGS_REPO_SLUG}/main"
+printf '%s\n' "${CONFIGS_REPO_URL}" > "${KAI_HOME}/configs_repo"
+echo "✓ Configs repo → ${KAI_HOME}/configs_repo"
 
 echo ""
 echo "✓ kai installed to ${KAI_BIN}/kai"
@@ -58,6 +59,6 @@ echo ""
 echo "Next steps:"
 echo "  1. Start a new shell (or run: source ${RC})"
 echo "  2. Get your kubeconfig from your lab manager, then run:"
-echo "       kai setup <kubeconfig.yaml>"
+echo "       kai setup <kai-kubeconfig-<user>.yaml>"
 echo "  3. Enable automatic config updates on login:"
 echo "       kai install"
