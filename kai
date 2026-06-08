@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # User home directory for all kai files — mirrors ~/.oh-my-zsh layout
-_VERSION  = "0.2.5"
+_VERSION  = "0.2.6"
 _KAI_HOME = os.path.expanduser("~/.kai")
 
 # Namespace for all workloads.
@@ -222,12 +222,9 @@ def _git_push_config(owner, repo, branch, path, content, message):
     print("done")
 
 
-# Queue → KAI built-in priorityClassName
-QUEUE_PRIORITY_CLASS = {
-    "preemptible": "train",   # value 50, reclaimable — exploratory queue
-    "default":     "train",   # same for now; will stay reclaimable until quota is set
-    # machine-specific queues (carnaroli, jasmine, etc.) fall through to "build"
-}
+# KAI built-in priority classes (value >= 100 = non-preemptible, in-quota only)
+PRIORITY_CLASSES = {"train", "build-preemptible", "build", "inference"}
+_DEFAULT_PRIORITY  = "train"
 
 # Friendly GPU type shorthand → nvidia.com/gpu.product label value
 GPU_TYPE_MAP = {
@@ -301,10 +298,10 @@ def _build_resources(gpu_count, cpu_req, mem_req):
 def _build_manifest(*, name, image, command, gpu_count, cpu_req, mem_req,
                     queue, node_selector, node_affinity, backoff_limit, envs,
                     interactive, volumes, ports, workdir, large_shm, attach,
-                    host_network=False):
+                    host_network=False, priority=None):
     pod_labels = {
         "kai.scheduler/queue": queue,
-        "priorityClassName":   QUEUE_PRIORITY_CLASS.get(queue, "build"),
+        "priorityClassName":   priority or _DEFAULT_PRIORITY,
     }
 
     container = {
@@ -450,6 +447,8 @@ def cmd_submit(args):
             args.forward = bool(_job.get("forward", False))
         if not args.host_network:
             args.host_network = bool(_job.get("host_network", False))
+        if not args.priority:
+            args.priority = _job.get("priority") or None
         # Command: file wins if CLI has none
         if not args.command:
             _cmd = _job.get("command")
@@ -467,6 +466,10 @@ def cmd_submit(args):
     # Enforce allowed_queues from config file
     if ALLOWED_QUEUES is not None and args.queue not in ALLOWED_QUEUES:
         _die(f"Queue '{args.queue}' is not in your allowed queues: {', '.join(ALLOWED_QUEUES)}")
+
+    # Validate priority class
+    if args.priority and args.priority not in PRIORITY_CLASSES:
+        _die(f"Unknown priority '{args.priority}'. Choose from: {', '.join(sorted(PRIORITY_CLASSES))}")
 
     # Resolve node placement
     node_selector = {}
@@ -518,6 +521,7 @@ def cmd_submit(args):
         large_shm=args.large_shm,
         attach=args.attach,
         host_network=args.host_network,
+        priority=args.priority,
     )
 
     kubectl("apply", "-f", "-", capture=True, stdin_data=json.dumps(manifest))
@@ -1397,6 +1401,8 @@ def main():
                    help="Mount a host directory into the container (repeatable)")
     p.add_argument("--port", "-p", action="append", metavar="PORT",
                    help="Declare a container port (repeatable; use with --forward to auto-forward)")
+    p.add_argument("--priority", metavar="CLASS",
+                   help="Priority class: train (default, preemptible), build-preemptible, build (non-preemptible), inference (non-preemptible)")
     p.add_argument("--forward", action="store_true",
                    help="After pod starts, port-forward all declared --port mappings (blocks until Ctrl-C)")
     p.add_argument("--host-network", action="store_true",
