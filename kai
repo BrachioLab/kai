@@ -104,7 +104,11 @@ def _load_config(explicit_path=None):
     if cfg.get("config_base_url"):
         CONFIG_BASE_URL = cfg["config_base_url"]
     if cfg.get("queue_nodes"):
-        QUEUE_NODES = dict(cfg["queue_nodes"])
+        # Normalize values to lists (string → [string]) so the rest of the code is uniform
+        QUEUE_NODES = {
+            k: ([v] if isinstance(v, str) else list(v))
+            for k, v in cfg["queue_nodes"].items()
+        }
 
 
 def _read_github_token():
@@ -250,8 +254,8 @@ def _build_resources(gpu_count, cpu_req, mem_req):
     return resources
 
 def _build_manifest(*, name, image, command, gpu_count, cpu_req, mem_req,
-                    queue, node_selector, backoff_limit, envs, interactive,
-                    volumes, ports, workdir, large_shm, attach):
+                    queue, node_selector, node_affinity, backoff_limit, envs,
+                    interactive, volumes, ports, workdir, large_shm, attach):
     pod_labels = {
         "kai.scheduler/queue": queue,
         "priorityClassName":   QUEUE_PRIORITY_CLASS.get(queue, "build"),
@@ -316,6 +320,14 @@ def _build_manifest(*, name, image, command, gpu_count, cpu_req, mem_req,
     }
     if node_selector:
         pod_spec["nodeSelector"] = node_selector
+    if node_affinity:
+        pod_spec["affinity"] = {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {
+            "nodeSelectorTerms": [{"matchExpressions": [{
+                "key": "kubernetes.io/hostname",
+                "operator": "In",
+                "values": node_affinity,
+            }]}]
+        }}}
     if vol_defs:
         pod_spec["volumes"] = vol_defs
 
@@ -349,12 +361,17 @@ def cmd_submit(args):
     if ALLOWED_QUEUES is not None and args.queue not in ALLOWED_QUEUES:
         _die(f"Queue '{args.queue}' is not in your allowed queues: {', '.join(ALLOWED_QUEUES)}")
 
-    # Resolve nodeSelector
+    # Resolve node placement
     node_selector = {}
+    node_affinity = None
     if args.node:
         node_selector["kubernetes.io/hostname"] = args.node
     elif QUEUE_NODES.get(args.queue):
-        node_selector["kubernetes.io/hostname"] = QUEUE_NODES[args.queue]
+        nodes = QUEUE_NODES[args.queue]
+        if len(nodes) == 1:
+            node_selector["kubernetes.io/hostname"] = nodes[0]
+        else:
+            node_affinity = nodes
     if args.gpu_type:
         label = GPU_TYPE_MAP.get(args.gpu_type.lower())
         if not label:
@@ -384,6 +401,7 @@ def cmd_submit(args):
         mem_req=args.memory,
         queue=args.queue,
         node_selector=node_selector,
+        node_affinity=node_affinity,
         backoff_limit=backoff,
         envs=envs,
         interactive=args.interactive,
@@ -1026,21 +1044,22 @@ def cmd_install(args):
 
 # ── queue management ───────────────────────────────────────────────────────────
 
-def _config_update_queue_node(queue_name, node):
-    """Add or remove a queue→node mapping in ~/.kai/config.yaml. Pass node=None to remove."""
+def _config_update_queue_node(queue_name, nodes):
+    """Add or remove a queue→node(s) mapping in ~/.kai/config.yaml. Pass nodes=None to remove."""
     config_path = os.path.join(_KAI_HOME, "config.yaml")
     try:
         with open(config_path) as f:
             cfg = yaml.safe_load(f) or {}
     except FileNotFoundError:
         cfg = {}
-    nodes = cfg.get("queue_nodes") or {}
-    if node is None:
-        nodes.pop(queue_name, None)
+    existing = cfg.get("queue_nodes") or {}
+    if nodes is None:
+        existing.pop(queue_name, None)
     else:
-        nodes[queue_name] = node
-    if nodes:
-        cfg["queue_nodes"] = nodes
+        # Store as string for single node (clean YAML), list for multiple
+        existing[queue_name] = nodes[0] if len(nodes) == 1 else nodes
+    if existing:
+        cfg["queue_nodes"] = existing
     elif "queue_nodes" in cfg:
         del cfg["queue_nodes"]
     with open(config_path, "w") as f:
@@ -1069,7 +1088,8 @@ def _queue_list():
         prio   = spec.get("priority", "—")
         res    = spec.get("resources", {})
         quota  = res.get("gpu", {}).get("quota", "—")
-        node   = QUEUE_NODES.get(meta["name"], "—")
+        nodes  = QUEUE_NODES.get(meta["name"])
+        node   = ",".join(nodes) if nodes else "—"
         rows.append((meta["name"], parent, str(prio), str(quota), node))
     _print_table(("NAME", "PARENT", "PRIORITY", "GPU-QUOTA", "NODE"), rows)
 
@@ -1097,7 +1117,8 @@ def _queue_create(args):
     msg = f"queue/{args.name} created  [parent: {parent}  priority: {args.priority}  gpu-quota: {args.quota}]"
     if args.node:
         _config_update_queue_node(args.name, args.node)
-        msg += f"  node:{args.node}"
+        node_str = ",".join(args.node)
+        msg += f"  node:{node_str}"
         print(msg)
         print(f"  → node selector saved to ~/.kai/config.yaml")
         print(f"  → Re-run 'kai add-user' for existing users and push to distribute")
@@ -1109,7 +1130,7 @@ def _queue_delete(args):
         _die("Only lab-managers can delete queues.")
     kubectl_global("delete", "queue", args.name)
     if args.name in QUEUE_NODES:
-        _config_update_queue_node(args.name, None)
+        _config_update_queue_node(args.name, None)  # None = remove
         print(f"queue/{args.name} deleted  (node selector removed from config)")
     else:
         print(f"queue/{args.name} deleted")
@@ -1327,8 +1348,8 @@ def main():
                     help="Priority (default: 100; 0 = preemptible)")
     qp.add_argument("--parent", metavar="QUEUE",
                     help="Parent queue name (default: from config file)")
-    qp.add_argument("--node", metavar="HOSTNAME",
-                    help="Pin all jobs submitted to this queue to a specific node")
+    qp.add_argument("--node", metavar="HOSTNAME", action="append",
+                    help="Pin jobs to a node (repeatable for multi-node groups: --node jasmine --node carnaroli)")
     qp = qsub.add_parser("delete", help="Delete a queue")
     qp.add_argument("name", metavar="NAME", help="Queue name")
     p.set_defaults(func=cmd_queue)
