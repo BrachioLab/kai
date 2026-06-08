@@ -5,8 +5,7 @@ kai — generic CLI for the KAI Scheduler.
 Usage:
   kai setup [CONFIG] KUBECONFIG    Install config and kubeconfig (CONFIG auto-fetched if configs repo is set)
   kai install                      Add update check hook to shell rc
-  kai update [--quiet] [--force]   Check for config update; prompts before applying
-  kai self-update                  Upgrade kai itself from GitHub
+  kai update [--quiet] [--force]   Check for binary and config updates; prompts before applying
   kai submit --image IMAGE [--gpu N] [--queue Q] [--node NODE] [-- CMD...]
   kai list / kai pods / kai gpus
   kai logs JOB [-f] / kai describe JOB / kai delete JOB...
@@ -889,25 +888,67 @@ def _fetch_config_update():
 
 
 def cmd_update(args):
-    """Fetch latest config from config_url and prompt before applying if changed.
+    """Check for binary and config updates; prompt before applying each.
 
-    --quiet: suppress the "up to date" message, but still prompt if an update is available.
+    --quiet: suppress "up to date" messages (still prompts if update available).
     --force: apply without prompting (for scripted use).
     """
     quiet = getattr(args, "quiet", False)
     force = getattr(args, "force", False)
 
+    # ── Binary update ──
+    kai_bin = os.path.join(_KAI_HOME, "bin", "kai")
+    if os.path.exists(kai_bin):
+        try:
+            req = urllib.request.Request(_KAI_SCRIPT_URL)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                new_script = resp.read()
+            with open(kai_bin, "rb") as f:
+                current_script = f.read()
+            if new_script == current_script:
+                if not quiet:
+                    print("kai binary is up to date")
+            else:
+                if not force:
+                    print()
+                    print("[kai] A kai update is available.")
+                    sys.stdout.write("[kai] Would you like to apply it? [Y/n] ")
+                    sys.stdout.flush()
+                    try:
+                        answer = sys.stdin.readline().strip().lower()
+                    except (KeyboardInterrupt, EOFError):
+                        print()
+                        answer = "n"
+                    if answer not in ("", "y", "yes"):
+                        print("[kai] Skipped. Run 'kai update' to apply manually.")
+                        print()
+                    else:
+                        print()
+                        with open(kai_bin, "wb") as f:
+                            f.write(new_script)
+                        os.chmod(kai_bin, 0o755)
+                        print("[kai] kai updated to latest version.")
+                else:
+                    with open(kai_bin, "wb") as f:
+                        f.write(new_script)
+                    os.chmod(kai_bin, 0o755)
+                    print("[kai] kai updated to latest version.")
+        except Exception as e:
+            if not quiet:
+                print(f"kai: binary update check failed: {e}", file=sys.stderr)
+
+    # ── Config update ──
     url_file = os.path.join(_KAI_HOME, "config_url")
     has_url = os.path.exists(url_file) or bool(CONFIG_URL)
     if not has_url:
         if not quiet:
-            print("kai: no config_url set — nothing to update", file=sys.stderr)
+            print("kai: no config_url set — skipping config update", file=sys.stderr)
         return
 
     new_content, current = _fetch_config_update()
     if new_content is None:
         if not quiet:
-            print("kai: update check failed", file=sys.stderr)
+            print("kai: config update check failed", file=sys.stderr)
         return
 
     if new_content.strip() == current.strip():
@@ -915,7 +956,6 @@ def cmd_update(args):
             print("kai config is up to date")
         return
 
-    # An update is available — always prompt unless --force
     if not force:
         print()
         print("[kai] A config update is available.")
@@ -941,11 +981,10 @@ def cmd_update(args):
 
 _INSTALL_HOOK = (
     "# kai: check for updates on login\n"
-    "kai self-update --quiet 2>/dev/null\n"
     "kai update --quiet 2>/dev/null\n"
 )
 # Sentinel that appears only in the current hook — used to detect stale versions
-_INSTALL_HOOK_SENTINEL = "kai self-update --quiet"
+_INSTALL_HOOK_SENTINEL = "kai update --quiet"
 # Sentinel that appears in any kai hook (old or new) — used to find the block to replace
 _INSTALL_HOOK_ANY = "# kai: check for"
 
@@ -983,64 +1022,6 @@ def cmd_install(args):
     print(f"  Takes effect in new shell sessions (or: source {rc_path})")
 
 
-def cmd_self_update(args):
-    """Check for a new kai binary and prompt before replacing it.
-
-    --quiet: suppress 'up to date' message (still prompts if update available).
-    --force: apply without prompting.
-    """
-    quiet = getattr(args, "quiet", False)
-    force = getattr(args, "force", False)
-
-    kai_bin = os.path.join(_KAI_HOME, "bin", "kai")
-    if not os.path.exists(kai_bin):
-        if not quiet:
-            _die(
-                "kai binary not found at ~/.kai/bin/kai\n"
-                "  Is kai installed via install.sh? If running from source, no self-update needed."
-            )
-        return
-
-    try:
-        req = urllib.request.Request(_KAI_SCRIPT_URL)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            new_script = resp.read()
-    except Exception as e:
-        if not quiet:
-            print(f"kai: self-update check failed: {e}", file=sys.stderr)
-        return
-
-    try:
-        with open(kai_bin, "rb") as f:
-            current_script = f.read()
-    except Exception:
-        current_script = b""
-
-    if new_script == current_script:
-        if not quiet:
-            print("kai is up to date")
-        return
-
-    if not force:
-        print()
-        print("[kai] A kai update is available.")
-        sys.stdout.write("[kai] Would you like to apply it? [Y/n] ")
-        sys.stdout.flush()
-        try:
-            answer = sys.stdin.readline().strip().lower()
-        except (KeyboardInterrupt, EOFError):
-            print()
-            return
-        if answer not in ("", "y", "yes"):
-            print("[kai] Skipped. Run 'kai self-update' to apply manually.")
-            print()
-            return
-        print()
-
-    with open(kai_bin, "wb") as f:
-        f.write(new_script)
-    os.chmod(kai_bin, 0o755)
-    print("[kai] kai updated to latest version.")
 
 
 # ── queue management ───────────────────────────────────────────────────────────
@@ -1331,14 +1312,6 @@ def main():
     # ── install ──
     p = sub.add_parser("install", help="Add login update hook to ~/.bashrc or ~/.zshrc")
     p.set_defaults(func=cmd_install)
-
-    # ── self-update ──
-    p = sub.add_parser("self-update", help="Check for a kai binary update; prompts before applying")
-    p.add_argument("--quiet", action="store_true",
-                   help="Suppress 'up to date' message (still prompts if update available)")
-    p.add_argument("--force", action="store_true",
-                   help="Apply without prompting")
-    p.set_defaults(func=cmd_self_update)
 
     # ── queue ──
     p = sub.add_parser("queue", help="Manage KAI scheduler queues (lab-manager only)")
