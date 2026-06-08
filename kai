@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # User home directory for all kai files — mirrors ~/.oh-my-zsh layout
-_VERSION  = "0.1.0"
+_VERSION  = "0.2.0"
 _KAI_HOME = os.path.expanduser("~/.kai")
 
 # Namespace for all workloads.
