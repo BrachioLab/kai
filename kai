@@ -4,9 +4,8 @@ kai — generic CLI for the KAI Scheduler.
 
 Usage:
   kai setup CONFIG KUBECONFIG      Install config and kubeconfig files (first-time setup)
-  kai install                      Add auto-update hook to shell rc
-  kai update [--quiet]             Pull latest config from GitHub
-  kai check-update                 Apply any pending config update (called on login)
+  kai install                      Add update check hook to shell rc
+  kai update [--quiet] [--force]   Check for config update; prompts before applying
   kai self-update                  Upgrade kai itself from GitHub
   kai submit --image IMAGE [--gpu N] [--queue Q] [--node NODE] [-- CMD...]
   kai list / kai pods / kai gpus
@@ -753,12 +752,13 @@ def _fetch_config_update():
 
 
 def cmd_update(args):
-    """Fetch latest config from config_url.
+    """Fetch latest config from config_url and prompt before applying if changed.
 
-    --quiet: write to ~/.kai/config.yaml.pending (applied on next login via check-update).
-    normal:  apply immediately.
+    --quiet: suppress the "up to date" message, but still prompt if an update is available.
+    --force: apply without prompting (for scripted use).
     """
     quiet = getattr(args, "quiet", False)
+    force = getattr(args, "force", False)
 
     url_file = os.path.join(_KAI_HOME, "config_url")
     has_url = os.path.exists(url_file) or bool(CONFIG_URL)
@@ -770,7 +770,7 @@ def cmd_update(args):
     new_content, current = _fetch_config_update()
     if new_content is None:
         if not quiet:
-            print("kai: update failed or no config_url set", file=sys.stderr)
+            print("kai: update check failed", file=sys.stderr)
         return
 
     if new_content.strip() == current.strip():
@@ -778,66 +778,36 @@ def cmd_update(args):
             print("kai config is up to date")
         return
 
-    if quiet:
-        # Write to pending file; user will be prompted on next login by check-update
-        pending = os.path.join(_KAI_HOME, "config.yaml.pending")
-        os.makedirs(_KAI_HOME, mode=0o700, exist_ok=True)
-        with open(pending, "w") as f:
-            f.write(new_content)
-    else:
-        config_path = os.path.join(_KAI_HOME, "config.yaml")
-        os.makedirs(_KAI_HOME, mode=0o700, exist_ok=True)
-        with open(config_path, "w") as f:
-            f.write(new_content)
-        print("✓ kai config updated")
-
-
-def cmd_check_update(args):
-    """Apply any pending config update, prompting the user first (oh-my-zsh style)."""
-    pending = os.path.join(_KAI_HOME, "config.yaml.pending")
-    if not os.path.exists(pending):
-        return
+    # An update is available — always prompt unless --force
+    if not force:
+        print()
+        print("[kai] A config update is available.")
+        sys.stdout.write("[kai] Would you like to apply it? [Y/n] ")
+        sys.stdout.flush()
+        try:
+            answer = sys.stdin.readline().strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return
+        if answer not in ("", "y", "yes"):
+            print("[kai] Skipped. Run 'kai update' to apply manually.")
+            print()
+            return
+        print()
 
     config_path = os.path.join(_KAI_HOME, "config.yaml")
-    try:
-        with open(pending) as f:
-            new_content = f.read()
-        try:
-            with open(config_path) as f:
-                current = f.read()
-        except FileNotFoundError:
-            current = ""
-        if new_content.strip() == current.strip():
-            os.unlink(pending)
-            return
-    except Exception:
-        return
-
-    print()
-    print("[kai] A config update is available.")
-    sys.stdout.write("[kai] Would you like to apply it? [Y/n] ")
-    sys.stdout.flush()
-    try:
-        answer = sys.stdin.readline().strip().lower()
-    except (KeyboardInterrupt, EOFError):
-        print()
-        return
-
-    if answer in ("", "y", "yes"):
-        shutil.move(pending, config_path)
-        print("[kai] Config updated.")
-    else:
-        print("[kai] Skipped. Run 'kai update' to apply manually.")
-    print()
+    os.makedirs(_KAI_HOME, mode=0o700, exist_ok=True)
+    with open(config_path, "w") as f:
+        f.write(new_content)
+    print("[kai] Config updated.")
 
 
 def cmd_install(args):
-    """Add login hooks to ~/.bashrc or ~/.zshrc for config update prompts."""
-    marker = "kai check-update"
+    """Add a login hook to ~/.bashrc or ~/.zshrc that checks for config updates."""
+    marker = "kai update --quiet"
     hook = (
-        "# kai: prompt for config updates on login\n"
-        "kai check-update 2>/dev/null\n"
-        "(kai update --quiet &) 2>/dev/null\n"
+        "# kai: check for config updates on login\n"
+        "kai update --quiet 2>/dev/null\n"
     )
 
     shell = os.path.basename(os.environ.get("SHELL", "bash"))
@@ -1123,17 +1093,15 @@ def main():
     p.set_defaults(func=cmd_setup)
 
     # ── update ──
-    p = sub.add_parser("update", help="Fetch latest config from GitHub")
+    p = sub.add_parser("update", help="Fetch latest config from GitHub; prompts before applying")
     p.add_argument("--quiet", action="store_true",
-                   help="Write to pending file; user is prompted on next login")
+                   help="Suppress 'up to date' message (still prompts if update available)")
+    p.add_argument("--force", action="store_true",
+                   help="Apply without prompting (for scripted use)")
     p.set_defaults(func=cmd_update)
 
-    # ── check-update ──
-    p = sub.add_parser("check-update", help="Prompt to apply any pending config update (called on login)")
-    p.set_defaults(func=cmd_check_update)
-
     # ── install ──
-    p = sub.add_parser("install", help="Add login hooks to ~/.bashrc or ~/.zshrc")
+    p = sub.add_parser("install", help="Add login update hook to ~/.bashrc or ~/.zshrc")
     p.set_defaults(func=cmd_install)
 
     # ── self-update ──
