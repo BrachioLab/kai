@@ -700,11 +700,7 @@ def cmd_add_user(args):
         cli_cfg["queue_nodes"] = dict(QUEUE_NODES)
 
     # Resolve config_base_url: prefer config file value, fall back to configs_repo + namespace
-    config_base_url = CONFIG_BASE_URL
-    if not config_base_url:
-        configs_repo = _read_configs_repo()
-        if configs_repo and NAMESPACE:
-            config_base_url = f"{configs_repo}/{NAMESPACE}"
+    config_base_url = CONFIG_BASE_URL or _read_configs_repo()
     if not config_base_url:
         _die(
             "config_base_url is not set — cannot push user config to GitHub.\n"
@@ -800,17 +796,11 @@ def cmd_setup(args):
                 "    kai setup <config.yaml> <kubeconfig.yaml>\n"
                 "  Or re-run install.sh and enter the configs repository."
             )
-        try:
-            with open(args.kubeconfig_file) as f:
-                kc = yaml.safe_load(f)
-            namespace = kc["contexts"][0]["context"]["namespace"]
-        except Exception as e:
-            _die(f"Could not read namespace from kubeconfig: {e}")
         username = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
         if not username:
             _die("Could not determine username from $USER — provide a config file explicitly.")
-        config_url = f"{configs_repo}/{namespace}/{username}.yaml"
-        print(f"Fetching config for '{username}' from {configs_repo}/{namespace}/ ...", end=" ", flush=True)
+        config_url = f"{configs_repo}/{username}.yaml"
+        print(f"Fetching config for '{username}' ...", end=" ", flush=True)
         try:
             req = urllib.request.Request(config_url)
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -819,7 +809,7 @@ def cmd_setup(args):
             if e.code == 404:
                 print()
                 _die(
-                    f"No config found for '{username}' in namespace '{namespace}'.\n"
+                    f"No config found for '{username}'.\n"
                     f"  Ask your lab manager to run: kai add-user --name {username}"
                 )
             _die(f"Failed to fetch config: HTTP {e.code}")
