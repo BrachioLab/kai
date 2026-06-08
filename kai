@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # User home directory for all kai files — mirrors ~/.oh-my-zsh layout
-_VERSION  = "0.2.0"
+_VERSION  = "0.2.1"
 _KAI_HOME = os.path.expanduser("~/.kai")
 
 # Namespace for all workloads.
@@ -442,6 +442,8 @@ def cmd_submit(args):
         # Volumes, ports: file provides lists; CLI appends on top
         args.volume = list(_job.get("volumes") or []) + list(args.volume or [])
         args.port = [str(p) for p in (_job.get("ports") or [])] + list(args.port or [])
+        if not args.forward:
+            args.forward = bool(_job.get("forward", False))
         # Command: file wins if CLI has none
         if not args.command:
             _cmd = _job.get("command")
@@ -527,6 +529,15 @@ def cmd_submit(args):
         pod = _wait_for_job_pod(name)
         print(f"Attaching to {pod}  (exit shell or Ctrl-P Ctrl-Q to detach)\n")
         kubectl("attach", "-it", pod, capture=False)
+        print(f"\nJob '{name}' still exists. To remove: kai delete {name}")
+    elif args.forward:
+        if not args.port:
+            _die("--forward requires at least one --port declaration")
+        mappings = [f"{p}:{p}" if ":" not in str(p) else str(p) for p in args.port]
+        print(f"Waiting for job {name} to start...")
+        pod = _wait_for_job_pod(name, timeout=600)
+        print(f"Forwarding {', '.join(mappings)}  (Ctrl-C to stop)\n")
+        kubectl("port-forward", f"pod/{pod}", *mappings, capture=False, check=False)
         print(f"\nJob '{name}' still exists. To remove: kai delete {name}")
     else:
         gpu_str = f"{args.gpu} GPU{'s' if args.gpu != 1 else ''}" if args.gpu else "CPU only"
@@ -1369,7 +1380,9 @@ def main():
     p.add_argument("--volume", "-v", action="append", metavar="HOST:CONTAINER[:ro]",
                    help="Mount a host directory into the container (repeatable)")
     p.add_argument("--port", "-p", action="append", metavar="PORT",
-                   help="Declare a container port (repeatable; use port-forward to access)")
+                   help="Declare a container port (repeatable; use with --forward to auto-forward)")
+    p.add_argument("--forward", action="store_true",
+                   help="After pod starts, port-forward all declared --port mappings (blocks until Ctrl-C)")
     p.add_argument("--workdir", "-w", metavar="PATH",
                    help="Set the working directory inside the container")
     p.add_argument("command", nargs=argparse.REMAINDER, metavar="-- COMMAND [ARGS]",
