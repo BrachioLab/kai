@@ -53,7 +53,7 @@ KUBECONFIG = os.environ.get("KUBECONFIG", _DEFAULT_KUBECONFIG)
 _KAI_SCRIPT_URL = "https://raw.githubusercontent.com/BrachioLab/kai/main/kai"
 
 # Populated from config file
-DEFAULT_QUEUE   = "preemptible"
+DEFAULT_QUEUE   = "default"
 ALLOWED_QUEUES  = None   # None = unrestricted (admin/no config file)
 ROLE            = None
 PARENT_QUEUE    = None
