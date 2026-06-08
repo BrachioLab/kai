@@ -1341,7 +1341,7 @@ def main():
                    help="Replace /dev/shm with an in-memory emptyDir (no size cap; needed for PyTorch multiprocessing)")
     p.add_argument("--backoff-limit", type=int, metavar="N",
                    help="Retry limit (default: 10 for preemptible, 0 for guaranteed queues)")
-    p.add_argument("--env", action="append", metavar="KEY=VALUE",
+    p.add_argument("--env", "-e", action="append", metavar="KEY=VALUE",
                    help="Set an environment variable (repeatable)")
     p.add_argument("--volume", "-v", action="append", metavar="HOST:CONTAINER[:ro]",
                    help="Mount a host directory into the container (repeatable)")
