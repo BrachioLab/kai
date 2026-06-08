@@ -181,7 +181,7 @@ def _github_push_file(owner, repo, branch, path, content, message, token):
 def _git_push_config(owner, repo, branch, path, content, message):
     """Commit and push a config file via git, using a local clone in ~/.kai/configs/."""
     clone_dir = os.path.join(_KAI_HOME, "configs")
-    clone_url = f"https://github.com/{owner}/{repo}.git"
+    clone_url = f"git@github.com:{owner}/{repo}.git"
 
     if os.path.isdir(os.path.join(clone_dir, ".git")):
         print(f"Pulling latest from github.com/{owner}/{repo}...", end=" ", flush=True)
