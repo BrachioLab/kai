@@ -3,7 +3,7 @@
 kai — generic CLI for the KAI Scheduler.
 
 Usage:
-  kai setup CONFIG KUBECONFIG      Install config and kubeconfig files (first-time setup)
+  kai setup CONFIG KUBECONFIG [--github-token TOKEN]  Install config and kubeconfig files (first-time setup)
   kai install                      Add update check hook to shell rc
   kai update [--quiet] [--force]   Check for config update; prompts before applying
   kai self-update                  Upgrade kai itself from GitHub
@@ -62,9 +62,6 @@ CONFIG_URL      = None   # Raw URL to fetch this user's config from GitHub
 CONFIG_BASE_URL = None   # Base URL for generating config URLs for new users
 QUEUE_NODES     = {}     # queue name → node hostname (client-side node selector)
 
-# Default output dir for generated configs (relative to this script)
-_CONFIGS_OUTPUT_DIR = os.path.join(_SCRIPT_DIR, "..", "05-access-control", "output", "configs")
-
 
 def _load_config(explicit_path=None):
     """Load kai config file; update globals with its values."""
@@ -120,6 +117,53 @@ def _read_github_token():
         return creds.get("github_token")
     except FileNotFoundError:
         return None
+
+def _parse_raw_github_url(url):
+    """Parse https://raw.githubusercontent.com/OWNER/REPO/BRANCH/PATH → (owner, repo, branch, path_prefix)."""
+    prefix = "https://raw.githubusercontent.com/"
+    if not url.startswith(prefix):
+        _die(f"config_base_url must be a raw.githubusercontent.com URL, got: {url}")
+    parts = url[len(prefix):].split("/", 3)
+    if len(parts) < 3:
+        _die(f"config_base_url is malformed: {url}")
+    return parts[0], parts[1], parts[2], (parts[3] if len(parts) > 3 else "")
+
+
+def _github_push_file(owner, repo, branch, path, content, message, token):
+    """Create or update a file in a GitHub repo via the Contents API."""
+    api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Content-Type": "application/json",
+    }
+    sha = None
+    try:
+        req = urllib.request.Request(api_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            sha = json.loads(resp.read()).get("sha")
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            _die(f"GitHub API error {e.code} checking {path}: {e.read().decode()}")
+
+    body = {
+        "message": message,
+        "content": base64.b64encode(content.encode()).decode(),
+        "branch": branch,
+    }
+    if sha:
+        body["sha"] = sha
+
+    req = urllib.request.Request(
+        api_url, data=json.dumps(body).encode(), headers=headers, method="PUT"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        _die(f"GitHub API error {e.code} pushing {path}: {e.read().decode()}")
+
 
 # Queue → KAI built-in priorityClassName
 QUEUE_PRIORITY_CLASS = {
@@ -648,31 +692,50 @@ def cmd_add_user(args):
     if QUEUE_NODES:
         cli_cfg["queue_nodes"] = dict(QUEUE_NODES)
 
-    # Write config to the tracked output dir (for git) if it exists, else cwd
-    configs_dir = os.path.normpath(_CONFIGS_OUTPUT_DIR)
-    if os.path.isdir(configs_dir):
-        config_file = os.path.join(configs_dir, f"{NAMESPACE}-{args.name}.yaml")
-        config_file_display = os.path.relpath(config_file)
-    else:
-        config_file = f"kai-config-{args.name}.yaml"
-        config_file_display = config_file
+    # Push CLI config to GitHub (mandatory)
+    if not CONFIG_BASE_URL:
+        _die(
+            "config_base_url is not set — cannot push user config to GitHub.\n"
+            "  This is set automatically when you ran 'kai setup' with a config that\n"
+            "  includes config_base_url. Check ~/.kai/config.yaml."
+        )
+    token = os.environ.get("KAI_GITHUB_TOKEN") or _read_github_token()
+    if not token:
+        _die(
+            "GitHub token required to push user configs.\n"
+            "  Store it in ~/.kai/credentials (github_token: ghp_...) or re-run:\n"
+            "    kai setup <config> <kubeconfig> --github-token <TOKEN>\n"
+            "  Or set KAI_GITHUB_TOKEN in your environment."
+        )
+
+    owner, repo, branch, path_prefix = _parse_raw_github_url(CONFIG_BASE_URL)
+    config_filename = f"{NAMESPACE}-{args.name}.yaml"
+    config_gh_path = f"{path_prefix}/{config_filename}" if path_prefix else config_filename
+    config_content = yaml.dump(cli_cfg, default_flow_style=False, sort_keys=False)
+
+    print(f"Pushing config to github.com/{owner}/{repo}...", end=" ", flush=True)
+    _github_push_file(
+        owner, repo, branch, config_gh_path,
+        config_content,
+        f"add {args.name} to {NAMESPACE}",
+        token,
+    )
+    print("done")
+
+    # Also write locally so the lab manager can hand it to the user for kai setup
+    config_file = f"kai-config-{args.name}.yaml"
     with open(config_file, "w") as f:
-        yaml.dump(cli_cfg, f, default_flow_style=False, sort_keys=False)
+        f.write(config_content)
 
     print(f"\n✓  {args.name}  [{args.role}]  namespace:{NAMESPACE}  queue:{queue}")
     print(f"\n   kubeconfig : {kubeconfig_file}  ← keep secret, share via secure channel")
-    print(f"   cli config : {config_file_display}  ← safe to share")
+    print(f"   cli config : {config_file}  ← safe to share (also pushed to GitHub)")
     print()
-    print("   1. Commit and push the config so the user can auto-update:")
-    print(f"        git add {config_file_display}")
-    print(f"        git commit -m 'add {args.name} to {NAMESPACE}'")
-    print(f"        git push")
-    print()
-    print("   2. Share the kubeconfig securely (Slack DM, encrypted email, etc.)")
-    print()
-    print(f"   3. User runs on their machine:")
-    print(f"        kai setup {config_file_display} {kubeconfig_file}")
-    print(f"        kai install")
+    print("   Share with the user:")
+    print(f"     1. Send {kubeconfig_file} securely (Slack DM, encrypted email, etc.)")
+    print(f"     2. User runs on their machine:")
+    print(f"          kai setup {config_file} {kubeconfig_file}")
+    print(f"          kai install")
 
     if args.role == "lab-manager":
         crb = f"{NAMESPACE}-{args.name}-queue-manager"
@@ -717,6 +780,20 @@ def cmd_setup(args):
             print(f"✓ config_url → {url_file}")
     except Exception:
         pass
+
+    # Store GitHub token if provided (needed by lab managers to push user configs)
+    if getattr(args, "github_token", None):
+        cred_path = os.path.join(_KAI_HOME, "credentials")
+        try:
+            with open(cred_path) as f:
+                creds = yaml.safe_load(f) or {}
+        except FileNotFoundError:
+            creds = {}
+        creds["github_token"] = args.github_token
+        with open(cred_path, "w") as f:
+            yaml.dump(creds, f, default_flow_style=False, sort_keys=False)
+        os.chmod(cred_path, 0o600)
+        print(f"✓ github_token → {cred_path}")
 
     print()
     print("Run 'kai install' to enable automatic config updates on login.")
@@ -1186,6 +1263,8 @@ def main():
                    help="Path to kai-config-<user>.yaml (received from lab manager)")
     p.add_argument("kubeconfig_file", metavar="KUBECONFIG",
                    help="Path to kai-kubeconfig-<user>.yaml (received via secure channel)")
+    p.add_argument("--github-token", metavar="TOKEN",
+                   help="GitHub personal access token (stored in ~/.kai/credentials; required for lab managers to push user configs)")
     p.set_defaults(func=cmd_setup)
 
     # ── update ──
