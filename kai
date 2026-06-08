@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # User home directory for all kai files — mirrors ~/.oh-my-zsh layout
-_VERSION  = "0.2.7"
+_VERSION  = "0.2.8"
 _KAI_HOME = os.path.expanduser("~/.kai")
 
 # Namespace for all workloads.
@@ -1082,9 +1082,6 @@ def cmd_setup(args):
             yaml.dump(creds, f, default_flow_style=False, sort_keys=False)
         os.chmod(cred_path, 0o600)
         print(f"✓ github_token → {cred_path}")
-
-    print()
-    print("Run 'kai install' to enable automatic config updates on login.")
 
 
 def _fetch_config_update():
