@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # User home directory for all kai files — mirrors ~/.oh-my-zsh layout
-_VERSION  = "0.2.8"
+_VERSION  = "0.2.9"
 _KAI_HOME = os.path.expanduser("~/.kai")
 
 # Namespace for all workloads.
@@ -301,6 +301,7 @@ def _build_manifest(*, name, image, command, gpu_count, cpu_req, mem_req,
                     host_network=False, priority=None):
     pod_labels = {
         "kai.scheduler/queue": queue,
+        "kai.scheduler/user":  os.environ.get("USER", "unknown"),
         "priorityClassName":   priority or _DEFAULT_PRIORITY,
     }
 
