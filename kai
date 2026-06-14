@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # User home directory for all kai files — mirrors ~/.oh-my-zsh layout
-_VERSION  = "0.2.9"
+_VERSION  = "0.3.0"
 _KAI_HOME = os.path.expanduser("~/.kai")
 
 # Namespace for all workloads.
@@ -298,7 +298,8 @@ def _build_resources(gpu_count, cpu_req, mem_req):
 def _build_manifest(*, name, image, command, gpu_count, cpu_req, mem_req,
                     queue, node_selector, node_affinity, backoff_limit, envs,
                     interactive, volumes, ports, workdir, large_shm, attach,
-                    host_network=False, priority=None):
+                    host_network=False, priority=None,
+                    run_as_uid=None, run_as_gid=None):
     pod_labels = {
         "kai.scheduler/queue": queue,
         "kai.scheduler/user":  os.environ.get("USER", "unknown"),
@@ -366,6 +367,14 @@ def _build_manifest(*, name, image, command, gpu_count, cpu_req, mem_req,
         "restartPolicy": "Never",
         "containers":    [container],
     }
+    # Run as the submitting user so files written to mounted host paths are
+    # owned by them rather than root. Omitted (= root) when run_as_uid is None.
+    if run_as_uid is not None:
+        pod_spec["securityContext"] = {
+            "runAsUser":  run_as_uid,
+            "runAsGroup": run_as_gid,
+            "fsGroup":    run_as_gid,
+        }
     if host_network:
         pod_spec["hostNetwork"] = True
         pod_spec["dnsPolicy"] = "ClusterFirstWithHostNet"
@@ -448,6 +457,8 @@ def cmd_submit(args):
             args.forward = bool(_job.get("forward", False))
         if not args.host_network:
             args.host_network = bool(_job.get("host_network", False))
+        if not args.root:
+            args.root = bool(_job.get("root", False))
         if not args.priority:
             args.priority = _job.get("priority") or None
         # Command: file wins if CLI has none
@@ -503,6 +514,15 @@ def cmd_submit(args):
     else:
         backoff = 10 if args.queue in ("preemptible", "default") else 0
 
+    # Run as the submitting user's UID/GID by default so output files written to
+    # mounted host paths are owned by them. --root opts out for images that must
+    # run as root (system-path installs, etc.).
+    if args.root:
+        run_as_uid = run_as_gid = None
+    else:
+        run_as_uid = os.getuid()
+        run_as_gid = os.getgid()
+
     manifest = _build_manifest(
         name=name,
         image=args.image,
@@ -523,6 +543,8 @@ def cmd_submit(args):
         attach=args.attach,
         host_network=args.host_network,
         priority=args.priority,
+        run_as_uid=run_as_uid,
+        run_as_gid=run_as_gid,
     )
 
     kubectl("apply", "-f", "-", capture=True, stdin_data=json.dumps(manifest))
@@ -1468,6 +1490,8 @@ def main():
                    help="After pod starts, port-forward all declared --port mappings (blocks until Ctrl-C)")
     p.add_argument("--host-network", action="store_true",
                    help="Use the node's network namespace (exposes ports directly on the host)")
+    p.add_argument("--root", action="store_true",
+                   help="Run the container as root (default: run as your UID/GID so output files are owned by you)")
     p.add_argument("--workdir", "-w", metavar="PATH",
                    help="Set the working directory inside the container")
     p.add_argument("command", nargs=argparse.REMAINDER, metavar="-- COMMAND [ARGS]",
