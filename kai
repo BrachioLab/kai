@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # User home directory for all kai files — mirrors ~/.oh-my-zsh layout
-_VERSION  = "0.3.0"
+_VERSION  = "0.3.1"
 _KAI_HOME = os.path.expanduser("~/.kai")
 
 # Namespace for all workloads.
@@ -482,6 +482,11 @@ def cmd_submit(args):
     # Validate priority class
     if args.priority and args.priority not in PRIORITY_CLASSES:
         _die(f"Unknown priority '{args.priority}'. Choose from: {', '.join(sorted(PRIORITY_CLASSES))}")
+
+    # --root is restricted to lab managers. ROLE is None when there is no config
+    # file (admin running directly), which is treated as unrestricted.
+    if args.root and ROLE not in ("lab-manager", "admin", None):
+        _die("--root is restricted to lab managers; jobs run as your own UID/GID by default.")
 
     # Resolve node placement
     node_selector = {}
