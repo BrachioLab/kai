@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # User home directory for all kai files — mirrors ~/.oh-my-zsh layout
-_VERSION  = "0.3.9"
+_VERSION  = "0.4.0"
 _KAI_HOME = os.path.expanduser("~/.kai")
 
 # Namespace for all workloads.
@@ -859,6 +859,28 @@ def _gpu_allocation():
                 alloc[node] = alloc.get(node, 0) + g
     return alloc
 
+
+def _queue_allocation():
+    """{queue name: GPUs currently requested} across all namespaces (Running/Pending)."""
+    r = kubectl("get", "pods", "--all-namespaces", "-o", "json", capture=True)
+    alloc = {}
+    for pod in json.loads(r.stdout).get("items", []):
+        if pod.get("status", {}).get("phase") not in ("Running", "Pending"):
+            continue
+        q = pod.get("metadata", {}).get("labels", {}).get("kai.scheduler/queue")
+        if not q:
+            continue
+        for c in pod.get("spec", {}).get("containers", []):
+            g = int(c.get("resources", {}).get("limits", {}).get("nvidia.com/gpu", 0) or 0)
+            if g:
+                alloc[q] = alloc.get(q, 0) + g
+    return alloc
+
+
+def _queue_free(quota, used):
+    """quota - used for finite quotas; '—' for unbounded (-1) / unset parents."""
+    return (quota - used) if isinstance(quota, int) and quota >= 0 else "—"
+
 def cmd_gpus(args):
     gpu_nodes = _discover_gpu_nodes()
     if not gpu_nodes:
@@ -1425,6 +1447,7 @@ def _queue_list():
     if not items:
         print("No queues found.")
         return
+    usage = _queue_allocation()
     rows = []
     for q in items:
         meta   = q["metadata"]
@@ -1433,10 +1456,48 @@ def _queue_list():
         prio   = spec.get("priority", "—")
         res    = spec.get("resources", {})
         quota  = res.get("gpu", {}).get("quota", "—")
+        used   = usage.get(meta["name"], 0)
+        free   = _queue_free(quota, used)
         nodes  = QUEUE_NODES.get(meta["name"])
         node   = ",".join(nodes) if nodes else "—"
-        rows.append((meta["name"], parent, str(prio), str(quota), node))
-    _print_table(("NAME", "PARENT", "PRIORITY", "GPU-QUOTA", "NODE"), rows)
+        rows.append((meta["name"], parent, str(prio), str(quota), str(used), str(free), node))
+    _print_table(("NAME", "PARENT", "PRIORITY", "GPU-QUOTA", "USED", "FREE", "NODE"), rows)
+
+
+def cmd_quota(args):
+    """Show GPU quota / used / free for the queues available to you."""
+    r = kubectl_global("get", "queues", "-o", "json")
+    items = json.loads(r.stdout).get("items", [])
+    if not items:
+        print("No queues found.")
+        return
+    usage = _queue_allocation()
+    # Which queues are "yours": explicit allowed_queues, else this lab's leaves
+    # (children of your parent queue), else every leaf queue.
+    if ALLOWED_QUEUES is not None:
+        relevant = set(ALLOWED_QUEUES)
+    elif PARENT_QUEUE:
+        relevant = {q["metadata"]["name"] for q in items
+                    if q.get("spec", {}).get("parentQueue") == PARENT_QUEUE}
+    else:
+        relevant = {q["metadata"]["name"] for q in items
+                    if q.get("spec", {}).get("parentQueue")}
+    rows = []
+    for q in sorted(items, key=lambda x: x["metadata"]["name"]):
+        name = q["metadata"]["name"]
+        if name not in relevant:
+            continue
+        quota = q.get("spec", {}).get("resources", {}).get("gpu", {}).get("quota", "—")
+        used  = usage.get(name, 0)
+        free  = _queue_free(quota, used)
+        mark  = " *" if name == DEFAULT_QUEUE else ""
+        rows.append((name + mark, str(quota), str(used), str(free)))
+    if not rows:
+        print("No queues available to you.")
+        return
+    _print_table(("QUEUE", "GPU-QUOTA", "USED", "FREE"), rows)
+    if DEFAULT_QUEUE and any(r[0].endswith(" *") for r in rows):
+        print("\n* your default queue (used when you omit --queue)")
 
 def _queue_create(args):
     if ROLE not in ("lab-manager", None) and ROLE != "admin":
@@ -1656,6 +1717,10 @@ def main():
     # ── gpus ──
     p = sub.add_parser("gpus", help="Show GPU availability across nodes")
     p.set_defaults(func=cmd_gpus)
+
+    # ── quota ──
+    p = sub.add_parser("quota", help="Show GPU quota/used/free for the queues available to you")
+    p.set_defaults(func=cmd_quota)
 
     # ── nodes ──
     p = sub.add_parser("nodes", help="Show node health, GPU usage, and active conditions")
