@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # User home directory for all kai files — mirrors ~/.oh-my-zsh layout
-_VERSION  = "0.3.4"
+_VERSION  = "0.3.5"
 _KAI_HOME = os.path.expanduser("~/.kai")
 
 # Namespace for all workloads.
@@ -938,7 +938,8 @@ def cmd_nodes(args):
 
 # ── user config helpers ────────────────────────────────────────────────────────
 
-def _build_and_push_config(username, role, queue, lab_name, commit_msg=None):
+def _build_and_push_config(username, role, queue, lab_name, commit_msg=None,
+                           allowed_queues=None):
     """Build a CLI config for a user and push it to GitHub (or write locally)."""
     config_base_url = CONFIG_BASE_URL or _read_configs_repo()
     if not config_base_url:
@@ -963,6 +964,9 @@ def _build_and_push_config(username, role, queue, lab_name, commit_msg=None):
     }
     if role == "lab-manager":
         cli_cfg["parent_queue"] = lab_name
+    if allowed_queues:
+        # Restrict this user to these queues (kai blocks --queue outside the list).
+        cli_cfg["allowed_queues"] = list(allowed_queues)
     if QUEUE_NODES:
         # Store lists as-is; single-element lists back to string for clean YAML
         cli_cfg["queue_nodes"] = {
@@ -1003,7 +1007,8 @@ def cmd_push_config(args):
     queue = getattr(args, "queue", None) or DEFAULT_QUEUE
     role = args.role or ROLE or "researcher"
     _build_and_push_config(username, role, queue, lab_name,
-                           commit_msg=f"update {username} in {NAMESPACE}")
+                           commit_msg=f"update {username} in {NAMESPACE}",
+                           allowed_queues=getattr(args, "allowed_queues", None))
 
 
 # ── add-user ───────────────────────────────────────────────────────────────────
@@ -1091,7 +1096,8 @@ def cmd_add_user(args):
 
     queue = getattr(args, "queue", None) or DEFAULT_QUEUE
     _build_and_push_config(args.name, args.role, queue, lab_name,
-                           commit_msg=f"add {args.name} to {NAMESPACE}")
+                           commit_msg=f"add {args.name} to {NAMESPACE}",
+                           allowed_queues=getattr(args, "allowed_queues", None))
 
     print(f"\n   kubeconfig : {kubeconfig_file}  ← keep secret, share via secure channel")
     print()
@@ -1660,6 +1666,8 @@ def main():
                    help="Role to assign (default: researcher)")
     p.add_argument("--queue", metavar="QUEUE",
                    help="Default queue for this user (default from config)")
+    p.add_argument("--allowed-queues", action="append", metavar="QUEUE",
+                   help="Restrict the user to these queue(s) (repeatable). Omit = unrestricted.")
     p.set_defaults(func=cmd_add_user)
 
     # ── push-config ──
@@ -1670,6 +1678,8 @@ def main():
                    help="Role (default: your own role for self-updates, researcher for others)")
     p.add_argument("--queue", metavar="QUEUE",
                    help="Default queue (default from config)")
+    p.add_argument("--allowed-queues", action="append", metavar="QUEUE",
+                   help="Restrict the user to these queue(s) (repeatable). Omit = unrestricted.")
     p.set_defaults(func=cmd_push_config)
 
     # ── setup ──
