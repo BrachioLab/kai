@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # User home directory for all kai files — mirrors ~/.oh-my-zsh layout
-_VERSION  = "0.3.3"
+_VERSION  = "0.3.4"
 _KAI_HOME = os.path.expanduser("~/.kai")
 
 # Namespace for all workloads.
@@ -521,6 +521,13 @@ def cmd_submit(args):
         run_as_uid = os.getuid()
         run_as_gid = os.getgid()
 
+    # Warn (don't silently proceed) if the resolved node target — from --node or
+    # a queue→node mapping — doesn't exist on this cluster, which would leave the
+    # job Pending forever. (--gpu-type is already resolved against live labels.)
+    _targets = ([node_selector["kubernetes.io/hostname"]]
+                if node_selector.get("kubernetes.io/hostname") else (node_affinity or []))
+    _warn_unknown_nodes(_targets, "job's")
+
     manifest = _build_manifest(
         name=name,
         image=args.image,
@@ -744,6 +751,63 @@ def cmd_bash(args):
     kubectl("exec", "-it", pod, "--", "bash", capture=False, check=False)
 
 # ── gpus ───────────────────────────────────────────────────────────────────────
+
+def _cluster_node_names():
+    """Set of node names in the cluster, or None if it can't be determined
+    (e.g. no node-read permission) — callers skip validation when None so a
+    missing kai-nodes-reader ClusterRole never breaks submit/setup."""
+    r = kubectl("get", "nodes", "-o", "jsonpath={.items[*].metadata.name}",
+                capture=True, check=False)
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    return set(r.stdout.split())
+
+def _warn_unknown_nodes(targets, context):
+    """Warn (don't silently proceed) if NONE of the target hostnames exist on the
+    cluster — that job/queue can never schedule. Skips quietly if nodes aren't
+    listable. Returns True if a fatal mismatch (no target exists) was warned."""
+    targets = [t for t in (targets or []) if t]
+    if not targets:
+        return False
+    cluster = _cluster_node_names()
+    if cluster is None:
+        return False
+    missing = [t for t in targets if t not in cluster]
+    if missing and not any(t in cluster for t in targets):
+        print(f"⚠  WARNING: {context} target node(s) do not exist on this cluster:",
+              file=sys.stderr)
+        print(f"     requested: {', '.join(sorted(set(targets)))}", file=sys.stderr)
+        print(f"     cluster has: {', '.join(sorted(cluster))}", file=sys.stderr)
+        print("   Such jobs stay Pending forever. This usually means your kai config", file=sys.stderr)
+        print("   is from a different cluster's configs repo — check ~/.kai/configs_repo", file=sys.stderr)
+        print("   and re-run 'kai setup', then resubmit.", file=sys.stderr)
+        return True
+    return False
+
+def _warn_setup_queue_nodes(cfg, kubeconfig_path):
+    """At setup time, warn if the config's queue→node mappings reference nodes
+    that don't exist on this cluster (the usual sign of a wrong configs repo)."""
+    qn = cfg.get("queue_nodes") or {}
+    if not qn:
+        return
+    global KUBECONFIG, NAMESPACE
+    KUBECONFIG = kubeconfig_path
+    if cfg.get("namespace"):
+        NAMESPACE = cfg["namespace"]
+    referenced = set()
+    for v in qn.values():
+        referenced.update([v] if isinstance(v, str) else list(v))
+    cluster = _cluster_node_names()
+    if cluster is None:
+        return
+    missing = sorted(n for n in referenced if n not in cluster)
+    if missing:
+        print(file=sys.stderr)
+        print("⚠  WARNING: your config maps queues to nodes NOT on this cluster:", file=sys.stderr)
+        print(f"     missing:     {', '.join(missing)}", file=sys.stderr)
+        print(f"     cluster has: {', '.join(sorted(cluster))}", file=sys.stderr)
+        print("   Jobs to those queues will stay Pending. Your configs repo may be for", file=sys.stderr)
+        print("   a different cluster — verify ~/.kai/configs_repo.", file=sys.stderr)
 
 def _discover_gpu_nodes():
     """Discover GPU nodes from the cluster. Count comes from node capacity;
@@ -1130,6 +1194,10 @@ def cmd_setup(args):
             yaml.dump(creds, f, default_flow_style=False, sort_keys=False)
         os.chmod(cred_path, 0o600)
         print(f"✓ github_token → {cred_path}")
+
+    # Sanity-check the config against the cluster: warn if queue→node mappings
+    # point at nodes that don't exist here (the classic wrong-configs-repo trap).
+    _warn_setup_queue_nodes(cfg, kubeconfig_dest)
 
 
 def _fetch_config_update():
