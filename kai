@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # User home directory for all kai files — mirrors ~/.oh-my-zsh layout
-_VERSION  = "0.3.5"
+_VERSION  = "0.3.6"
 _KAI_HOME = os.path.expanduser("~/.kai")
 
 # Namespace for all workloads.
@@ -226,6 +226,10 @@ def _git_push_config(owner, repo, branch, path, content, message):
 PRIORITY_CLASSES = {"train", "build-preemptible", "build", "inference"}
 _DEFAULT_PRIORITY  = "train"
 
+# Shell to drop into for interactive/bash/exec — prefer bash, fall back to sh
+# so it works on minimal images (busybox, alpine, distroless) that lack bash.
+_SHELL_FALLBACK = ["sh", "-c", "command -v bash >/dev/null 2>&1 && exec bash || exec sh"]
+
 # GPU node inventory and GPU types are discovered LIVE from the cluster
 # (node capacity + GPU Feature Discovery labels) — see _discover_gpu_nodes().
 # Nothing here is hardcoded, so any cluster's GPUs appear automatically.
@@ -377,26 +381,22 @@ def _build_manifest(*, name, image, command, gpu_count, cpu_req, mem_req,
     if vol_defs:
         pod_spec["volumes"] = vol_defs
 
-    if interactive:
-        return {
-            "apiVersion": "v1",
-            "kind":       "Pod",
-            "metadata":   {"name": name, "namespace": NAMESPACE, "labels": pod_labels},
-            "spec":       pod_spec,
-        }
-    else:
-        return {
-            "apiVersion": "batch/v1",
-            "kind":       "Job",
-            "metadata":   {"name": name, "namespace": NAMESPACE},
-            "spec": {
-                "backoffLimit": backoff_limit,
-                "template": {
-                    "metadata": {"labels": pod_labels},
-                    "spec":     pod_spec,
-                },
+    # Always a Job — including --interactive (which runs `sleep infinity` and is
+    # exec'd into). A bare Pod would require pods:create, which the researcher
+    # Role does not grant; jobs:create it does, so interactive works within the
+    # researcher RBAC.
+    return {
+        "apiVersion": "batch/v1",
+        "kind":       "Job",
+        "metadata":   {"name": name, "namespace": NAMESPACE},
+        "spec": {
+            "backoffLimit": backoff_limit,
+            "template": {
+                "metadata": {"labels": pod_labels},
+                "spec":     pod_spec,
             },
-        }
+        },
+    }
 
 # ── submit ─────────────────────────────────────────────────────────────────────
 
@@ -555,14 +555,19 @@ def cmd_submit(args):
     kubectl("apply", "-f", "-", capture=True, stdin_data=json.dumps(manifest))
 
     if args.interactive:
-        print(f"Waiting for pod {name} to be ready...")
-        _wait_for_pod(name)
+        print(f"Waiting for {name} to start...")
+        pod = _wait_for_job_pod(name, timeout=600)
         print(f"Connected to {name}  (exit or Ctrl-D to quit)\n")
-        kubectl("exec", "-it", name, "--", "bash", capture=False)
-        answer = input(f"\nDelete pod '{name}'? [Y/n] ").strip().lower()
+        kubectl("exec", "-it", pod, "--", *_SHELL_FALLBACK, capture=False, check=False)
+        try:
+            answer = input(f"\nDelete job '{name}'? [Y/n] ").strip().lower()
+        except EOFError:
+            answer = "n"
         if answer in ("", "y", "yes"):
-            kubectl("delete", "pod", name, capture=True)
-            print(f"Deleted pod {name}.")
+            kubectl("delete", "job", name, capture=True)
+            print(f"Deleted {name}.")
+        else:
+            print(f"'{name}' still running. Reconnect: kai bash {name}   Remove: kai delete {name}")
     elif args.attach:
         print(f"Waiting for job {name} to start...")
         pod = _wait_for_job_pod(name)
@@ -740,15 +745,15 @@ def cmd_describe(args):
 # ── exec ───────────────────────────────────────────────────────────────────────
 
 def cmd_exec(args):
-    cmd  = args.command or ["bash"]
+    cmd  = args.command or _SHELL_FALLBACK
     pod  = _resolve_pod(args.pod)
     tty_flags = ["-it"] if sys.stdin.isatty() else ["-i"]
     kubectl("exec", *tty_flags, pod, "--", *cmd, capture=False, check=False)
 
 def cmd_bash(args):
-    """Open an interactive bash shell in a running job (equivalent to runai bash)."""
+    """Open an interactive shell in a running job (equivalent to runai bash)."""
     pod = _resolve_pod(args.pod)
-    kubectl("exec", "-it", pod, "--", "bash", capture=False, check=False)
+    kubectl("exec", "-it", pod, "--", *_SHELL_FALLBACK, capture=False, check=False)
 
 # ── gpus ───────────────────────────────────────────────────────────────────────
 
