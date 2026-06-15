@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # User home directory for all kai files — mirrors ~/.oh-my-zsh layout
-_VERSION  = "0.3.1"
+_VERSION  = "0.3.2"
 _KAI_HOME = os.path.expanduser("~/.kai")
 
 # Namespace for all workloads.
@@ -187,16 +187,16 @@ def _git_push_config(owner, repo, branch, path, content, message):
     if os.path.isdir(os.path.join(clone_dir, ".git")):
         # Ensure the remote uses SSH (migrate old HTTPS clones)
         subprocess.run(["git", "-C", clone_dir, "remote", "set-url", "origin", clone_url],
-                       check=True, capture_output=True)
+                       check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         print(f"Pulling latest from github.com/{owner}/{repo}...", end=" ", flush=True)
         result = subprocess.run(["git", "-C", clone_dir, "pull", "--quiet"],
-                                capture_output=True, text=True)
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         if result.returncode != 0:
             _die(f"git pull failed:\n{result.stderr.strip()}")
     else:
         print(f"Cloning github.com/{owner}/{repo}...", end=" ", flush=True)
         result = subprocess.run(["git", "clone", "--quiet", clone_url, clone_dir],
-                                capture_output=True, text=True)
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         if result.returncode != 0:
             _die(f"git clone failed:\n{result.stderr.strip()}")
     print("done")
@@ -209,14 +209,14 @@ def _git_push_config(owner, repo, branch, path, content, message):
     subprocess.run(["git", "-C", clone_dir, "add", path], check=True)
     result = subprocess.run(
         ["git", "-C", clone_dir, "commit", "-m", message],
-        capture_output=True, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
     )
     if result.returncode != 0 and "nothing to commit" not in result.stdout:
         _die(f"git commit failed:\n{result.stderr.strip()}")
 
     print(f"Pushing to github.com/{owner}/{repo}...", end=" ", flush=True)
     result = subprocess.run(["git", "-C", clone_dir, "push", "--quiet"],
-                            capture_output=True, text=True)
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
     if result.returncode != 0:
         _die(f"git push failed:\n{result.stderr.strip()}")
     print("done")
@@ -250,7 +250,7 @@ def kubectl(*args, capture=True, check=True, stdin_data=None):
     cmd = ["kubectl", "--kubeconfig", KUBECONFIG, "--namespace", NAMESPACE] + list(args)
     if capture:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, check=False,
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=False,
             input=stdin_data,
         )
         if check and result.returncode != 0:
@@ -258,7 +258,7 @@ def kubectl(*args, capture=True, check=True, stdin_data=None):
             sys.exit(result.returncode)
         return result
     else:
-        subprocess.run(cmd, check=False, input=stdin_data, text=bool(stdin_data))
+        subprocess.run(cmd, check=False, input=stdin_data, universal_newlines=bool(stdin_data))
         return None
 
 def kubectl_global(*args, capture=True, check=True, stdin_data=None):
@@ -266,7 +266,7 @@ def kubectl_global(*args, capture=True, check=True, stdin_data=None):
     cmd = ["kubectl", "--kubeconfig", KUBECONFIG] + list(args)
     if capture:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, check=False,
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=False,
             input=stdin_data,
         )
         if check and result.returncode != 0:
@@ -274,7 +274,7 @@ def kubectl_global(*args, capture=True, check=True, stdin_data=None):
             sys.exit(result.returncode)
         return result
     else:
-        subprocess.run(cmd, check=False, input=stdin_data, text=bool(stdin_data))
+        subprocess.run(cmd, check=False, input=stdin_data, universal_newlines=bool(stdin_data))
         return None
 
 # ── Manifest builder ───────────────────────────────────────────────────────────
@@ -578,9 +578,9 @@ def cmd_submit(args):
             local_port = m.split(":")[0]
             r = subprocess.run(
                 ["ss", "-Hlntp", f"sport = :{local_port}"],
-                capture_output=True, text=True)
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
             for pid in set(re.findall(r"pid=(\d+)", r.stdout)):
-                subprocess.run(["kill", "-9", pid], capture_output=True)
+                subprocess.run(["kill", "-9", pid], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         time.sleep(1)
         print(f"Waiting for job {name} to start...")
         pod = _wait_for_job_pod(name, timeout=600)
@@ -1385,7 +1385,9 @@ def _fmt_age(ts):
     if not ts:
         return "—"
     try:
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        # strptime (not datetime.fromisoformat, which is py3.7+) for RHEL/Rocky
+        # login nodes on python 3.6. K8s stamps are whole-second RFC3339 + 'Z'.
+        dt = datetime.strptime(ts.replace("Z", "+0000"), "%Y-%m-%dT%H:%M:%S%z")
         s  = int((datetime.now(timezone.utc) - dt).total_seconds())
         if s < 60:     return f"{s}s"
         if s < 3600:   return f"{s // 60}m"
