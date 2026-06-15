@@ -12,7 +12,7 @@ KAI_SCRIPT_URL="https://raw.githubusercontent.com/BrachioLab/kai/main/kai"
 # ── Prompt for required info before downloading anything ──────────────────────
 
 echo ""
-printf "Configs repository (e.g. brachiolab/brachiolab-configs): "
+printf "Configs repository (e.g. brachiolab/locust-configs): "
 read -r CONFIGS_REPO_SLUG
 if [ -z "${CONFIGS_REPO_SLUG}" ]; then
     echo "error: configs repository is required" >&2
