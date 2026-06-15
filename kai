@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # User home directory for all kai files — mirrors ~/.oh-my-zsh layout
-_VERSION  = "0.3.2"
+_VERSION  = "0.3.3"
 _KAI_HOME = os.path.expanduser("~/.kai")
 
 # Namespace for all workloads.
@@ -226,23 +226,9 @@ def _git_push_config(owner, repo, branch, path, content, message):
 PRIORITY_CLASSES = {"train", "build-preemptible", "build", "inference"}
 _DEFAULT_PRIORITY  = "train"
 
-# Friendly GPU type shorthand → nvidia.com/gpu.product label value
-GPU_TYPE_MAP = {
-    "h200":      "NVIDIA-H200-NVL",
-    "6000":      "NVIDIA-RTX-PRO-6000-Blackwell-Workstation-Edition",
-    "blackwell": "NVIDIA-RTX-PRO-6000-Blackwell-Workstation-Edition",
-    "4090":      "NVIDIA-GeForce-RTX-4090",
-    "4000":      "NVIDIA-RTX-4000-Ada-Generation",
-    "ada":       "NVIDIA-RTX-4000-Ada-Generation",
-}
-
-# GPU node inventory — used by the gpus command
-GPU_NODES = {
-    "carnaroli":   {"name": "H200 NVL",         "mem_gb": 140, "count": 4},
-    "jasmine":     {"name": "RTX PRO 6000 BW",  "mem_gb": 96,  "count": 2},
-    "hylian":      {"name": "RTX 4090",         "mem_gb": 24,  "count": 3},
-    "koshihikari": {"name": "RTX 4000 Ada",     "mem_gb": 20,  "count": 3},
-}
+# GPU node inventory and GPU types are discovered LIVE from the cluster
+# (node capacity + GPU Feature Discovery labels) — see _discover_gpu_nodes().
+# Nothing here is hardcoded, so any cluster's GPUs appear automatically.
 
 # ── kubectl helpers ────────────────────────────────────────────────────────────
 
@@ -500,10 +486,17 @@ def cmd_submit(args):
         else:
             node_affinity = nodes
     if args.gpu_type:
-        label = GPU_TYPE_MAP.get(args.gpu_type.lower())
-        if not label:
-            _die(f"Unknown GPU type '{args.gpu_type}'. Valid: {', '.join(GPU_TYPE_MAP)}")
-        node_selector["nvidia.com/gpu.product"] = label
+        # Resolve the requested type against live GPU product labels in the
+        # cluster (case-insensitive substring), e.g. a100 -> NVIDIA-A100-80GB-PCIe.
+        products = sorted({i["product"] for i in _discover_gpu_nodes().values()})
+        want     = args.gpu_type.lower()
+        matches  = [p for p in products if want in p.lower()]
+        if len(matches) == 1:
+            node_selector["nvidia.com/gpu.product"] = matches[0]
+        elif not matches:
+            _die(f"No GPU type matching '{args.gpu_type}'. Available: {', '.join(products) or '(none)'}")
+        else:
+            _die(f"GPU type '{args.gpu_type}' is ambiguous — matches: {', '.join(matches)}. Be more specific.")
 
     # Parse --env KEY=VALUE
     envs = {}
@@ -752,35 +745,64 @@ def cmd_bash(args):
 
 # ── gpus ───────────────────────────────────────────────────────────────────────
 
-def cmd_gpus(args):
-    r = kubectl("get", "pods", "-o", "json", capture=True)
-    pods = json.loads(r.stdout).get("items", [])
+def _discover_gpu_nodes():
+    """Discover GPU nodes from the cluster. Count comes from node capacity;
+    product/memory from GPU Feature Discovery labels (set by the GPU operator).
+    Returns {node: {name, product, count, mem_gb}}. No hardcoding — works on
+    any cluster. Requires node read (the kai-nodes-reader ClusterRole)."""
+    r = kubectl("get", "nodes", "-o", "json", capture=True)
+    out = {}
+    for n in json.loads(r.stdout).get("items", []):
+        cap   = n.get("status", {}).get("capacity", {})
+        count = int(cap.get("nvidia.com/gpu", 0) or 0)
+        if count <= 0:
+            continue
+        labels  = n["metadata"].get("labels", {})
+        product = labels.get("nvidia.com/gpu.product", "GPU")
+        mem_mib = labels.get("nvidia.com/gpu.memory")
+        try:
+            mem_gb = int(round(int(mem_mib) / 1024)) if mem_mib else None
+        except (ValueError, TypeError):
+            mem_gb = None
+        out[n["metadata"]["name"]] = {
+            "name":    product.replace("NVIDIA-", "").replace("-", " "),
+            "product": product,
+            "count":   count,
+            "mem_gb":  mem_gb,
+        }
+    return out
 
-    # Count GPU requests for Running/Pending pods per node
-    allocated = {}
-    for pod in pods:
-        phase    = pod.get("status", {}).get("phase", "")
-        node     = pod.get("spec", {}).get("nodeName") or "_pending"
-        if phase not in ("Running", "Pending"):
+def _gpu_allocation():
+    """{node: GPUs currently requested} across all namespaces (Running/Pending)."""
+    r = kubectl("get", "pods", "--all-namespaces", "-o", "json", capture=True)
+    alloc = {}
+    for pod in json.loads(r.stdout).get("items", []):
+        if pod.get("status", {}).get("phase") not in ("Running", "Pending"):
+            continue
+        node = pod.get("spec", {}).get("nodeName")
+        if not node:
             continue
         for c in pod.get("spec", {}).get("containers", []):
-            gpus = int(c.get("resources", {}).get("limits", {}).get("nvidia.com/gpu", 0))
-            if gpus:
-                allocated[node] = allocated.get(node, 0) + gpus
+            g = int(c.get("resources", {}).get("limits", {}).get("nvidia.com/gpu", 0) or 0)
+            if g:
+                alloc[node] = alloc.get(node, 0) + g
+    return alloc
+
+def cmd_gpus(args):
+    gpu_nodes = _discover_gpu_nodes()
+    if not gpu_nodes:
+        print("No GPU nodes found in the cluster.")
+        return
+    allocated = _gpu_allocation()
 
     rows = []
     total_count = total_used = 0
-    for node, info in GPU_NODES.items():
+    for node, info in sorted(gpu_nodes.items()):
         used  = allocated.get(node, 0)
-        free  = info["count"] - used
-        rows.append((
-            node,
-            f"{info['name']} ({info['mem_gb']}GB)",
-            str(info["count"]),
-            str(used),
-            str(free),
-        ))
-        total_count += info["count"]
+        count = info["count"]
+        mem   = f" ({info['mem_gb']}GB)" if info["mem_gb"] else ""
+        rows.append((node, f"{info['name']}{mem}", str(count), str(used), str(count - used)))
+        total_count += count
         total_used  += used
 
     _print_table(
@@ -839,12 +861,10 @@ def cmd_nodes(args):
                 issues.append(cond_type)
         issues_str = ", ".join(issues) if issues else "—"
 
-        # GPU info (GPU nodes only)
-        gpu_info = GPU_NODES.get(name)
-        if gpu_info:
-            total = gpu_info["count"]
-            used  = allocated.get(name, 0)
-            gpu_col = f"{used}/{total}"
+        # GPU info from live node capacity (GPU nodes only)
+        gpu_total = int(node.get("status", {}).get("capacity", {}).get("nvidia.com/gpu", 0) or 0)
+        if gpu_total:
+            gpu_col = f"{allocated.get(name, 0)}/{gpu_total}"
         else:
             gpu_col = "—"
 
@@ -1474,9 +1494,9 @@ def main():
     p.add_argument("--queue", "-q", default=None,
                    help=f"Queue to submit to (default from config: {DEFAULT_QUEUE})")
     p.add_argument("--node", metavar="HOSTNAME",
-                   help="Pin job to a specific node: carnaroli, jasmine, hylian, koshihikari")
+                   help="Pin job to a specific node by hostname (see 'kai nodes')")
     p.add_argument("--gpu-type", metavar="TYPE",
-                   help="Pin to a GPU type: h200, 6000/blackwell, 4090, 4000/ada")
+                   help="Pin to a GPU type, matched against live node labels (e.g. a100, a6000, h200; see 'kai gpus')")
     p.add_argument("--interactive", action="store_true",
                    help="Start an interactive shell session (runs sleep+exec; creates a Pod)")
     p.add_argument("--attach", action="store_true",
