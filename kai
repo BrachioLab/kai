@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # User home directory for all kai files — mirrors ~/.oh-my-zsh layout
-_VERSION  = "0.3.8"
+_VERSION  = "0.3.9"
 _KAI_HOME = os.path.expanduser("~/.kai")
 
 # Namespace for all workloads.
@@ -61,6 +61,7 @@ PARENT_QUEUE    = None
 CONFIG_URL      = None   # Raw URL to fetch this user's config from GitHub
 CONFIG_BASE_URL = None   # Base URL for generating config URLs for new users
 QUEUE_NODES     = {}     # queue name → node hostname (client-side node selector)
+_DEFAULT_BACKOFF_LIMIT = 10   # job retries after eviction/preemption unless --backoff-limit overrides
 
 
 def _load_config(explicit_path=None):
@@ -506,11 +507,12 @@ def cmd_submit(args):
         k, v = e.split("=", 1)
         envs[k] = v
 
-    # backoffLimit default: preemptible jobs retry after eviction; guaranteed queues fail fast
+    # backoffLimit: jobs retry after eviction/preemption by default; override with
+    # --backoff-limit. (No per-queue-name logic — queue names are lab-prefixed now.)
     if args.backoff_limit is not None:
         backoff = args.backoff_limit
     else:
-        backoff = 10 if args.queue in ("preemptible", "default") else 0
+        backoff = _DEFAULT_BACKOFF_LIMIT
 
     # Run as the submitting user's UID/GID by default so output files written to
     # mounted host paths are owned by them. --root opts out for images that must
@@ -1583,7 +1585,7 @@ def main():
     p.add_argument("--large-shm", action="store_true",
                    help="Replace /dev/shm with an in-memory emptyDir (no size cap; needed for PyTorch multiprocessing)")
     p.add_argument("--backoff-limit", type=int, metavar="N",
-                   help="Retry limit (default: 10 for preemptible, 0 for guaranteed queues)")
+                   help="Retry limit after eviction/preemption (default: 10)")
     p.add_argument("--env", "-e", action="append", metavar="KEY=VALUE",
                    help="Set an environment variable (repeatable)")
     p.add_argument("--volume", "-v", action="append", metavar="HOST:CONTAINER[:ro]",
