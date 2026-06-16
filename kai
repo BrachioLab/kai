@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # User home directory for all kai files — mirrors ~/.oh-my-zsh layout
-_VERSION  = "0.4.0"
+_VERSION  = "0.5.0"
 _KAI_HOME = os.path.expanduser("~/.kai")
 
 # Namespace for all workloads.
@@ -54,7 +54,7 @@ KUBECONFIG = os.environ.get("KUBECONFIG", _DEFAULT_KUBECONFIG)
 _KAI_SCRIPT_URL = "https://raw.githubusercontent.com/BrachioLab/kai/main/kai"
 
 # Populated from config file
-DEFAULT_QUEUE   = "default"
+DEFAULT_QUEUE   = "preemptible"   # bare lane name; namespace is prepended at submit (-> <ns>-preemptible)
 ALLOWED_QUEUES  = None   # None = unrestricted (admin/no config file)
 ROLE            = None
 PARENT_QUEUE    = None
@@ -62,6 +62,24 @@ CONFIG_URL      = None   # Raw URL to fetch this user's config from GitHub
 CONFIG_BASE_URL = None   # Base URL for generating config URLs for new users
 QUEUE_NODES     = {}     # queue name → node hostname (client-side node selector)
 _DEFAULT_BACKOFF_LIMIT = 10   # job retries after eviction/preemption unless --backoff-limit overrides
+
+
+def _resolve_queue(q):
+    """A bare lane name (no '-', e.g. 'priority'/'preemptible'/'collaborators')
+    gets the namespace prepended: 'priority' -> '<namespace>-priority'. A
+    fully-qualified queue name (already contains '-') is used verbatim."""
+    if q and "-" not in q and NAMESPACE:
+        return "{}-{}".format(NAMESPACE, q)
+    return q
+
+
+def _priority_for_queue(q):
+    """Derive the KAI priority class from the queue lane (no --priority flag):
+    guaranteed lanes (*-priority / *-collaborators) are non-preemptible ('build');
+    everything else (the *-preemptible borrow lane) is preemptible ('train')."""
+    if q and (q.endswith("-priority") or q.endswith("-collaborators")):
+        return "build"
+    return "train"
 
 
 def _load_config(explicit_path=None):
@@ -446,8 +464,6 @@ def cmd_submit(args):
             args.host_network = bool(_job.get("host_network", False))
         if not args.root:
             args.root = bool(_job.get("root", False))
-        if not args.priority:
-            args.priority = _job.get("priority") or None
         # Command: file wins if CLI has none
         if not args.command:
             _cmd = _job.get("command")
@@ -462,13 +478,18 @@ def cmd_submit(args):
 
     name = args.name or _unique_name()
 
+    # Resolve the queue: a bare lane name (priority/preemptible/collaborators)
+    # gets the namespace prepended → <namespace>-<lane>.
+    args.queue = _resolve_queue(args.queue)
+
     # Enforce allowed_queues from config file
     if ALLOWED_QUEUES is not None and args.queue not in ALLOWED_QUEUES:
         _die(f"Queue '{args.queue}' is not in your allowed queues: {', '.join(ALLOWED_QUEUES)}")
 
-    # Validate priority class
-    if args.priority and args.priority not in PRIORITY_CLASSES:
-        _die(f"Unknown priority '{args.priority}'. Choose from: {', '.join(sorted(PRIORITY_CLASSES))}")
+    # Priority class is DERIVED from the queue lane — no --priority flag.
+    # Guaranteed lanes (*-priority/*-collaborators) are non-preemptible; the
+    # *-preemptible borrow lane is preemptible.
+    priority = _priority_for_queue(args.queue)
 
     # --root is restricted to lab managers. ROLE is None when there is no config
     # file (admin running directly), which is treated as unrestricted.
@@ -549,7 +570,7 @@ def cmd_submit(args):
         large_shm=args.large_shm,
         attach=args.attach,
         host_network=args.host_network,
-        priority=args.priority,
+        priority=priority,
         run_as_uid=run_as_uid,
         run_as_gid=run_as_gid,
     )
@@ -1590,9 +1611,9 @@ def main():
         epilog=textwrap.dedent("""\
         examples:
           kai submit -f vllm.yaml
-          kai submit --image pytorch:24.01 --gpu 1 -- python train.py
-          kai submit --image pytorch:24.01 --gpu 2 --node carnaroli -- torchrun --nproc=2 train.py
-          kai submit --image pytorch:24.01 --gpu 1 --queue preemptible -- python explore.py
+          kai submit --image pytorch:24.01 --gpu 1 -- python train.py          # default: preemptible (borrow)
+          kai submit --image pytorch:24.01 --gpu 1 --queue priority -- python train.py   # guaranteed on your lab's nodes
+          kai submit --image pytorch:24.01 --gpu 1 --queue preemptible --gpu-type a6000 -- python explore.py   # borrow any idle A6000
           kai submit --image pytorch:24.01 --gpu 1 --gpu-type h200 --interactive
           kai submit --image pytorch:24.01 --gpu 1 -v /data/datasets:/data -w /workspace -- python train.py
           kai submit --image pytorch:24.01 --gpu 1 --large-shm -- python train.py
@@ -1634,7 +1655,9 @@ def main():
     p.add_argument("--memory", "--mem", metavar="SIZE",
                    help="Memory request, e.g. '32Gi' (default: 32Gi per GPU)")
     p.add_argument("--queue", "-q", default=None,
-                   help=f"Queue to submit to (default from config: {DEFAULT_QUEUE})")
+                   help="Lane: 'priority' (guaranteed, non-preemptible, your nodes) or "
+                        "'preemptible' (borrow, default). Namespace is prepended automatically; "
+                        "a full queue name is also accepted.")
     p.add_argument("--node", metavar="HOSTNAME",
                    help="Pin job to a specific node by hostname (see 'kai nodes')")
     p.add_argument("--gpu-type", metavar="TYPE",
@@ -1653,8 +1676,6 @@ def main():
                    help="Mount a host directory into the container (repeatable)")
     p.add_argument("--port", "-p", action="append", metavar="PORT",
                    help="Declare a container port (repeatable; use with --forward to auto-forward)")
-    p.add_argument("--priority", metavar="CLASS",
-                   help="Priority class: train (default, preemptible), build-preemptible, build (non-preemptible), inference (non-preemptible)")
     p.add_argument("--forward", action="store_true",
                    help="After pod starts, port-forward all declared --port mappings (blocks until Ctrl-C)")
     p.add_argument("--host-network", action="store_true",
