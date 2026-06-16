@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # User home directory for all kai files — mirrors ~/.oh-my-zsh layout
-_VERSION  = "0.5.0"
+_VERSION  = "0.5.1"
 _KAI_HOME = os.path.expanduser("~/.kai")
 
 # Namespace for all workloads.
@@ -55,6 +55,9 @@ _KAI_SCRIPT_URL = "https://raw.githubusercontent.com/BrachioLab/kai/main/kai"
 
 # Populated from config file
 DEFAULT_QUEUE   = "preemptible"   # bare lane name; namespace is prepended at submit (-> <ns>-preemptible)
+NAMESPACE_QUEUES = False   # opt-in (config `namespace_queues: true`): prepend the namespace to a bare
+                           # queue lane (<ns>-<lane>). OFF by default so clusters with plain queue
+                           # names (e.g. the testbed's `default`/`preemptible`) keep working.
 ALLOWED_QUEUES  = None   # None = unrestricted (admin/no config file)
 ROLE            = None
 PARENT_QUEUE    = None
@@ -68,7 +71,7 @@ def _resolve_queue(q):
     """A bare lane name (no '-', e.g. 'priority'/'preemptible'/'collaborators')
     gets the namespace prepended: 'priority' -> '<namespace>-priority'. A
     fully-qualified queue name (already contains '-') is used verbatim."""
-    if q and "-" not in q and NAMESPACE:
+    if q and "-" not in q and NAMESPACE and NAMESPACE_QUEUES:
         return "{}-{}".format(NAMESPACE, q)
     return q
 
@@ -84,7 +87,7 @@ def _priority_for_queue(q):
 
 def _load_config(explicit_path=None):
     """Load kai config file; update globals with its values."""
-    global NAMESPACE, KUBECONFIG, DEFAULT_QUEUE, ALLOWED_QUEUES, ROLE, PARENT_QUEUE
+    global NAMESPACE, KUBECONFIG, DEFAULT_QUEUE, ALLOWED_QUEUES, ROLE, PARENT_QUEUE, NAMESPACE_QUEUES
     global CONFIG_URL, CONFIG_BASE_URL, QUEUE_NODES
 
     paths = []
@@ -113,6 +116,8 @@ def _load_config(explicit_path=None):
         KUBECONFIG = os.path.expanduser(cfg["kubeconfig"])
     if cfg.get("default_queue"):
         DEFAULT_QUEUE = cfg["default_queue"]
+    if cfg.get("namespace_queues"):
+        NAMESPACE_QUEUES = True
     if cfg.get("allowed_queues") is not None:
         ALLOWED_QUEUES = list(cfg["allowed_queues"])
     if cfg.get("role"):
