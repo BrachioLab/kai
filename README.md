@@ -49,7 +49,26 @@ kai submit --image pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime --gpu 1 --inter
 
 # Mount a local directory
 kai submit --image pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime --gpu 1 -v /data/datasets:/data -- python train.py
+
+# Mount your home directory at the same path (so ~ and relative paths line up)
+kai submit --image pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime --gpu 1 --mount-home -- python ~/proj/train.py
 ```
+
+### Identity & home inside the container
+
+Jobs run as **your UID/GID** (not root) so files you write are owned by you. kai
+fills in sane defaults for that user so common tools don't trip over the image's
+missing `/etc/passwd` entry — you can override any of them with `-e`:
+
+- `USER` / `LOGNAME` = your username (stops `getpass.getuser()`, torch, pip, etc.
+  from crashing with *"uid not found"*).
+- `HOME` = `/tmp` (writable scratch), or your **mounted home path** when you pass
+  `--mount-home`.
+
+`--mount-home` bind-mounts your host home directory into the container at the same
+path and sets `$HOME` to it. Because the job runs as your UID, writes are owned by
+you — and on an NFS `root_squash` home, your UID is exactly the one allowed to write.
+Pass `--root` to run as root instead (these defaults are then skipped).
 
 ### Queues / lanes
 

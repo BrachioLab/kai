@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # User home directory for all kai files — mirrors ~/.oh-my-zsh layout
-_VERSION  = "0.5.1"
+_VERSION  = "0.5.2"
 _KAI_HOME = os.path.expanduser("~/.kai")
 
 # Namespace for all workloads.
@@ -469,6 +469,8 @@ def cmd_submit(args):
             args.host_network = bool(_job.get("host_network", False))
         if not args.root:
             args.root = bool(_job.get("root", False))
+        if not args.mount_home:
+            args.mount_home = bool(_job.get("mount_home", False))
         # Command: file wins if CLI has none
         if not args.command:
             _cmd = _job.get("command")
@@ -548,6 +550,27 @@ def cmd_submit(args):
     else:
         run_as_uid = os.getuid()
         run_as_gid = os.getgid()
+
+    # --mount-home: bind-mount the submitter's home directory into the container
+    # at the SAME path and point $HOME at it, so relative paths and ~ line up.
+    # Jobs run as your UID, so files written there are owned by you (and on an
+    # NFS root_squash home this is exactly the UID that can write it).
+    home_dir = os.path.expanduser("~")
+    if args.mount_home:
+        if not (home_dir and os.path.isdir(home_dir)):
+            _die("--mount-home: could not determine your home directory ($HOME).")
+        args.volume = list(args.volume or []) + ["{0}:{0}".format(home_dir)]
+        envs.setdefault("HOME", home_dir)
+
+    # For non-root (run-as-user) jobs, supply sane defaults so tools that look up
+    # the UID in /etc/passwd (getpass.getuser(), torch._dynamo, pip, etc.) don't
+    # crash on the image's missing passwd entry, and $HOME points somewhere
+    # writable. Only fill what the user didn't already set via -e / a job file.
+    if run_as_uid is not None:
+        username = os.environ.get("USER") or os.environ.get("LOGNAME") or "kai"
+        envs.setdefault("USER", username)
+        envs.setdefault("LOGNAME", username)
+        envs.setdefault("HOME", "/tmp")   # world-writable scratch; --mount-home overrides above
 
     # Warn (don't silently proceed) if the resolved node target — from --node or
     # a queue→node mapping — doesn't exist on this cluster, which would leave the
@@ -1621,6 +1644,7 @@ def main():
           kai submit --image pytorch:24.01 --gpu 1 --queue preemptible --gpu-type a6000 -- python explore.py   # borrow any idle A6000
           kai submit --image pytorch:24.01 --gpu 1 --gpu-type h200 --interactive
           kai submit --image pytorch:24.01 --gpu 1 -v /data/datasets:/data -w /workspace -- python train.py
+          kai submit --image pytorch:24.01 --gpu 1 --mount-home -- python ~/proj/train.py   # mount your home; $HOME points at it
           kai submit --image pytorch:24.01 --gpu 1 --large-shm -- python train.py
           kai submit --image pytorch:24.01 --gpu 1 --attach -- /bin/bash -lc 'source ~/.bashrc; exec bash'
           kai submit --image jupyter/base-notebook --port 8888 -- jupyter lab --ip=0.0.0.0
@@ -1679,6 +1703,9 @@ def main():
                    help="Set an environment variable (repeatable)")
     p.add_argument("--volume", "-v", action="append", metavar="HOST:CONTAINER[:ro]",
                    help="Mount a host directory into the container (repeatable)")
+    p.add_argument("--mount-home", action="store_true",
+                   help="Mount your home directory into the container at the same path and point $HOME at it "
+                        "(jobs run as your UID, so writes are owned by you)")
     p.add_argument("--port", "-p", action="append", metavar="PORT",
                    help="Declare a container port (repeatable; use with --forward to auto-forward)")
     p.add_argument("--forward", action="store_true",
