@@ -35,11 +35,14 @@ That's it — you're ready to submit jobs.
 ## Submitting jobs
 
 ```sh
-# Run a script on 1 GPU
+# Run a script on 1 GPU (default lane: preemptible — see "Queues / lanes" below)
 kai submit --image pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime --gpu 1 -- python train.py
 
-# Run on a specific node
-kai submit --image pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime --gpu 2 --node carnaroli -- torchrun --nproc=2 train.py
+# Guaranteed run on your lab's own nodes (non-preemptible, protected up to quota)
+kai submit --image pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime --gpu 1 --queue priority -- python train.py
+
+# Borrow any idle A6000 anywhere (preemptible; yields when an owner needs it)
+kai submit --image pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime --gpu 1 --queue preemptible --gpu-type a6000 -- python sweep.py
 
 # Interactive session (opens a shell inside the container)
 kai submit --image pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime --gpu 1 --interactive
@@ -47,6 +50,20 @@ kai submit --image pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime --gpu 1 --inter
 # Mount a local directory
 kai submit --image pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime --gpu 1 -v /data/datasets:/data -- python train.py
 ```
+
+### Queues / lanes
+
+You pick a **lane** with `--queue`; that's the only knob — it decides both where
+your job is guaranteed and whether it can be evicted. kai prepends your lab's
+namespace automatically (`--queue priority` → `<yourlab>-priority`).
+
+| `--queue` | What you get |
+|-----------|--------------|
+| *(omitted)* / `preemptible` | **Borrow** — runs on any idle GPU, **preemptible**: reclaimed when an owner needs that node. The safe default; an accident can't block the cluster. |
+| `priority` | **Guaranteed** — runs on **your lab's own nodes**, non-preemptible, protected up to your lab's quota. Use for runs that must not be evicted. |
+
+Pick hardware with `--gpu-type` (e.g. `--gpu-type a6000`), or a specific machine
+with `--node <hostname>`. There is **no `--priority` flag** — the lane sets it.
 
 ## Managing jobs
 
