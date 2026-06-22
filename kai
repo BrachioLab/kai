@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # User home directory for all kai files — mirrors ~/.oh-my-zsh layout
-_VERSION  = "0.5.2"
+_VERSION  = "0.5.3"
 _KAI_HOME = os.path.expanduser("~/.kai")
 
 # Namespace for all workloads.
@@ -1540,11 +1540,13 @@ def cmd_quota(args):
         used  = usage.get(name, 0)
         free  = _queue_free(quota, used)
         mark  = " *" if name == DEFAULT_QUEUE else ""
-        rows.append((name + mark, str(quota), str(used), str(free)))
+        nodes = QUEUE_NODES.get(name)
+        node  = ",".join(nodes) if nodes else "—"
+        rows.append((name + mark, str(quota), str(used), str(free), node))
     if not rows:
         print("No queues available to you.")
         return
-    _print_table(("QUEUE", "GPU-QUOTA", "USED", "FREE"), rows)
+    _print_table(("QUEUE", "GPU-QUOTA", "USED", "FREE", "NODES"), rows)
     if DEFAULT_QUEUE and any(r[0].endswith(" *") for r in rows):
         print("\n* your default queue (used when you omit --queue)")
 
