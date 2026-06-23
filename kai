@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # User home directory for all kai files — mirrors ~/.oh-my-zsh layout
-_VERSION  = "0.5.3"
+_VERSION  = "0.5.5"
 _KAI_HOME = os.path.expanduser("~/.kai")
 
 # Namespace for all workloads.
@@ -1050,6 +1050,10 @@ def _build_and_push_config(username, role, queue, lab_name, commit_msg=None,
         cli_cfg["queue_nodes"] = {
             k: (v[0] if len(v) == 1 else v) for k, v in QUEUE_NODES.items()
         }
+    if NAMESPACE_QUEUES:
+        # Carry the opt-in so the user's kai prepends the namespace to bare lanes
+        # (`--queue priority` -> `<ns>-priority`). Without it, lane submits break.
+        cli_cfg["namespace_queues"] = True
 
     owner, repo, branch, path_prefix = _parse_raw_github_url(config_base_url)
     config_gh_path = f"{path_prefix}/{username}.yaml" if path_prefix else f"{username}.yaml"
@@ -1067,10 +1071,11 @@ def _build_and_push_config(username, role, queue, lab_name, commit_msg=None,
         print("done")
     else:
         _git_push_config(owner, repo, branch, config_gh_path, config_content, msg)
-    # Keep local config in sync so `kai update` doesn't immediately flag a diff
-    local_config_path = os.path.join(_KAI_HOME, "config.yaml")
-    with open(local_config_path, "w") as f:
-        f.write(config_content)
+    # NOTE: do NOT write this to ~/.kai/config.yaml — the person running add-user
+    # (an admin/lab-manager) is not the user being created, so overwriting their
+    # local config would clobber their own setup. The new config lives in the
+    # repo (above) + the per-user kai-config-<name>.yaml file; the user pulls it
+    # via `kai setup` / `kai update`.
 
     print(f"✓  {username}  [{role}]  namespace:{NAMESPACE}  queue:{queue}")
     print(f"   cli config → github.com/{owner}/{repo}/{config_gh_path}")
