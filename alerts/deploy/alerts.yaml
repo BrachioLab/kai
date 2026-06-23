@@ -1,0 +1,83 @@
+---
+# kai-alerts controller — emails opt-in job alerts (finish / long-running / near-mem-limit).
+# Reads alerts.py from the kai-alerts-src ConfigMap (built by deploy.sh) and SMTP
+# config from the kai-alerts-smtp Secret. Deploy with deploy/deploy.sh.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kai-alerts
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kai-alerts
+  namespace: kai-alerts
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kai-alerts
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "patch"]   # patch = write kai.alerts/sent-* dedupe annotations
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kai-alerts
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kai-alerts
+subjects:
+  - kind: ServiceAccount
+    name: kai-alerts
+    namespace: kai-alerts
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kai-alerts
+  namespace: kai-alerts
+  labels: { app: kai-alerts }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: kai-alerts }
+  template:
+    metadata:
+      labels: { app: kai-alerts }
+    spec:
+      serviceAccountName: kai-alerts
+      containers:
+        - name: alerts
+          image: python:3.12-slim
+          command: ["python3", "/app/alerts.py"]
+          env:
+            # SMTP config + cluster label come from the secret (optional: true so
+            # the pod still runs — in harmless no-send mode — before it exists).
+            - { name: KAI_ALERTS_SMTP_HOST, valueFrom: { secretKeyRef: { name: kai-alerts-smtp, key: host,    optional: true } } }
+            - { name: KAI_ALERTS_SMTP_PORT, valueFrom: { secretKeyRef: { name: kai-alerts-smtp, key: port,    optional: true } } }
+            - { name: KAI_ALERTS_SMTP_USER, valueFrom: { secretKeyRef: { name: kai-alerts-smtp, key: user,    optional: true } } }
+            - { name: KAI_ALERTS_SMTP_PASS, valueFrom: { secretKeyRef: { name: kai-alerts-smtp, key: pass,    optional: true } } }
+            - { name: KAI_ALERTS_FROM,      valueFrom: { secretKeyRef: { name: kai-alerts-smtp, key: from,    optional: true } } }
+            - { name: KAI_ALERTS_SMTP_TLS,  valueFrom: { secretKeyRef: { name: kai-alerts-smtp, key: tls,     optional: true } } }
+            - { name: KAI_ALERTS_CLUSTER,   valueFrom: { secretKeyRef: { name: kai-alerts-smtp, key: cluster, optional: true } } }
+            - { name: KAI_ALERTS_INTERVAL,  value: "60" }
+            - { name: MALLOC_ARENA_MAX,     value: "2" }
+          resources:
+            requests: { cpu: "20m", memory: "64Mi" }
+            limits:   { cpu: "250m", memory: "256Mi" }
+          volumeMounts:
+            - { name: src, mountPath: /app, readOnly: true }
+      volumes:
+        - name: src
+          configMap: { name: kai-alerts-src }
