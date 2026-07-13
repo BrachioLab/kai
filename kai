@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # User home directory for all kai files — mirrors ~/.oh-my-zsh layout
-_VERSION  = "0.6.0"
+_VERSION  = "0.6.1"
 _KAI_HOME = os.path.expanduser("~/.kai")
 
 # Namespace for all workloads.
@@ -335,7 +335,8 @@ def _build_manifest(*, name, image, command, gpu_count, cpu_req, mem_req,
                     queue, node_selector, node_affinity, backoff_limit, envs,
                     interactive, volumes, ports, workdir, large_shm, attach,
                     host_network=False, priority=None,
-                    run_as_uid=None, run_as_gid=None, annotations=None):
+                    run_as_uid=None, run_as_gid=None, annotations=None,
+                    image_pull_policy=None):
     pod_labels = {
         "kai.scheduler/queue": queue,
         "kai.scheduler/user":  os.environ.get("USER", "unknown"),
@@ -347,6 +348,10 @@ def _build_manifest(*, name, image, command, gpu_count, cpu_req, mem_req,
         "image":     image,
         "resources": _build_resources(gpu_count, cpu_req, mem_req),
     }
+    if image_pull_policy:
+        # Default for a ':latest' tag is Always (re-checks the registry every
+        # start); IfNotPresent uses a locally-cached image without contacting it.
+        container["imagePullPolicy"] = image_pull_policy
 
     if interactive:
         container["command"] = ["sleep", "infinity"]
@@ -496,6 +501,8 @@ def cmd_submit(args):
             args.root = bool(_job.get("root", False))
         if not args.mount_home:
             args.mount_home = bool(_job.get("mount_home", False))
+        if not args.image_pull_policy and _job.get("image_pull_policy"):
+            args.image_pull_policy = _job["image_pull_policy"]
         # Command: file wins if CLI has none
         if not args.command:
             _cmd = _job.get("command")
@@ -645,6 +652,7 @@ def cmd_submit(args):
         run_as_uid=run_as_uid,
         run_as_gid=run_as_gid,
         annotations=alert_ann or None,
+        image_pull_policy=args.image_pull_policy,
     )
 
     kubectl("apply", "-f", "-", capture=True, stdin_data=json.dumps(manifest))
@@ -1782,6 +1790,8 @@ def main():
                    help="Use the node's network namespace (exposes ports directly on the host)")
     p.add_argument("--root", action="store_true",
                    help="Run the container as root (default: run as your UID/GID so output files are owned by you)")
+    p.add_argument("--image-pull-policy", choices=["Always", "IfNotPresent", "Never"], metavar="POLICY",
+                   help="imagePullPolicy (default: k8s picks — Always for :latest). IfNotPresent uses a cached image without contacting the registry")
     p.add_argument("--workdir", "-w", metavar="PATH",
                    help="Set the working directory inside the container")
     # ── email alerts (opt-in; handled by the in-cluster kai-alerts controller) ──
