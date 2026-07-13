@@ -97,17 +97,32 @@ Pass `--root` to run as root instead (these defaults are then skipped).
 
 ### Queues / lanes
 
-You pick a **lane** with `--queue`; that's the only knob — it decides both where
-your job is guaranteed and whether it can be evicted. kai prepends your lab's
-namespace automatically (`--queue priority` → `<yourlab>-priority`).
+You pick two things — a **lane** (`--queue`) and a **GPU type** (`--gpu-type`) —
+and kai routes the job to the right queue for you. You never type a queue name.
 
-| `--queue` | What you get |
-|-----------|--------------|
-| *(omitted)* / `preemptible` | **Borrow** — runs on any idle GPU, **preemptible**: reclaimed when an owner needs that node. The safe default; an accident can't block the cluster. |
-| `priority` | **Guaranteed** — runs on **your lab's own nodes**, non-preemptible, protected up to your lab's quota. Use for runs that must not be evicted. |
+| `--queue` | GPU type | What you get |
+|-----------|----------|--------------|
+| *(omitted)* / `preemptible` | optional | **Borrow** — runs on any idle GPU (of the type, if you give one), **preemptible**: reclaimed when an owner needs it. The safe default. |
+| `priority` | **required** | **Guaranteed** — your lab's contributed quota of that GPU type, non-preemptible. |
+| `collaborators` | **required** | Like `priority`, for external collaborators (if your lab has a collaborator quota). |
 
-Pick hardware with `--gpu-type` (e.g. `--gpu-type a6000`), or a specific machine
-with `--node <hostname>`. There is **no `--priority` flag** — the lane sets it.
+```sh
+kai submit --image … --gpu 1 --gpu-type a100 --queue priority -- python train.py   # guaranteed A100
+kai submit --image … --gpu 1 --gpu-type a6000                 -- python sweep.py    # borrow an idle A6000
+kai submit --image … --gpu 1                                  -- python quick.py    # borrow any idle GPU
+```
+
+How it maps (done automatically): `--gpu-type a100 --queue priority` →
+`<yourlab>-a100-priority`; the borrow lane is `<yourlab>-preemptible` (any type).
+**Guaranteed lanes require `--gpu-type`** — you can't ask for a guaranteed GPU
+without saying which kind (kai will tell you). Your guaranteed quota is **per
+type**: e.g. "12 A100 + 8 A6000" are separate pools. Within a type, the scheduler
+places you on any node of that type (GPUs of a type are interchangeable); use
+`--node <hostname>` only if you need a specific machine.
+
+kai **warns** when you omit `--queue` (defaults to borrow) or `--gpu-type` (job
+may land on any GPU type), so you always know what you got. There is **no
+`--priority` flag** — the lane sets it. See your quotas with `kai quota`.
 
 ### Job files
 
