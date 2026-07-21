@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # User home directory for all kai files — mirrors ~/.oh-my-zsh layout
-_VERSION  = "0.6.1"
+_VERSION  = "0.6.2"
 _KAI_HOME = os.path.expanduser("~/.kai")
 
 # Namespace for all workloads.
@@ -67,7 +67,7 @@ QUEUE_NODES     = {}     # queue name → node hostname(s) — HARD placement (n
 _DEFAULT_BACKOFF_LIMIT = 10   # job retries after eviction/preemption unless --backoff-limit overrides
 
 
-_GUARANTEED_LANES = ("priority", "collaborators")
+_TYPED_LANES = ("priority",)   # only 'priority' is per-GPU-type (requires --gpu-type)
 
 
 def _canon_gpu_type(t):
@@ -80,17 +80,18 @@ def _resolve_queue(q, gpu_type=None):
     """Map a bare lane to a full queue name (only when namespace_queues is on;
     plain clusters and already-qualified names pass through).
 
-    Guaranteed lanes are PER GPU TYPE and require a type:
-        priority       + --gpu-type a100 -> <ns>-a100-priority
-        collaborators  + --gpu-type a6000 -> <ns>-a6000-collaborators
-    The borrow lane is a catch-all (any GPU), no type in the name:
-        preemptible                       -> <ns>-preemptible
+    'priority' is PER GPU TYPE and requires a type:
+        priority + --gpu-type a100  -> <ns>-a100-priority
+    'collaborators' and 'preemptible' are type-agnostic (one queue per lab, any
+    GPU; --gpu-type optionally narrows placement but isn't required):
+        collaborators               -> <ns>-collaborators
+        preemptible                 -> <ns>-preemptible
     """
     if not (q and NAMESPACE and NAMESPACE_QUEUES):
         return q
     if "-" in q:
         return q  # already fully-qualified
-    if q in _GUARANTEED_LANES:
+    if q in _TYPED_LANES:
         if not gpu_type:
             _die("--queue {0} requires --gpu-type: guaranteed queues are per GPU "
                  "type (e.g. --gpu-type a100 --queue {0}).".format(q))
@@ -523,7 +524,7 @@ def cmd_submit(args):
         _warn(f"no --queue given; using default lane '{DEFAULT_QUEUE}' "
               f"(borrow/preemptible — may be reclaimed when an owner needs the GPU).")
     # Warn when a GPU job doesn't pin a type (borrow lane can land on any GPU type).
-    if args.gpu and not args.gpu_type and args.queue not in _GUARANTEED_LANES:
+    if args.gpu and not args.gpu_type and args.queue not in _TYPED_LANES:
         _warn("no --gpu-type given; this job may be scheduled on ANY GPU type. "
               "Pass --gpu-type (e.g. a100) to pin the hardware.")
 

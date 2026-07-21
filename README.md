@@ -191,7 +191,7 @@ kai queue list            # all queues, quotas, and pinned nodes
 ```sh
 # add a user to your lab (creates their RBAC + kubeconfig, pushes their CLI config)
 kai add-user --name <user> [--role researcher|lab-manager]
-kai add-user --name <user> --allowed-queues <lab>-a6000-collaborators --allowed-queues <lab>-preemptible
+kai add-user --name <user> --allowed-queues <lab>-collaborators --allowed-queues <lab>-preemptible
 
 kai push-config --name <user> [--allowed-queues <q>]   # update a user's config (no cluster change)
 
